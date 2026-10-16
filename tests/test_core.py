@@ -505,3 +505,18 @@ def test_an_output_register_assigned_to_itself_in_comb_is_a_no_op():
 
     with pytest.raises(RefKitError, match="is a register"):
         run(Clash, [{"en": 0}], widths={"q": 4})
+
+
+def test_a_synchronous_reset_acts_only_on_the_edge_the_register_is_clocked_by():
+    class Neg(Module):
+        q = Reg(8, reset=0x34)
+
+        @seq(edge="neg")
+        def f(self):
+            self.q.next = self.d
+
+    steps = [{"clk": 1, "d": 0x7F, "reset": 0}, {"clk": 0, "d": 0x7F, "reset": 0},
+             {"clk": 0, "d": 0, "reset": 1}, {"clk": 1, "d": 0, "reset": 1}, {"clk": 0, "d": 0, "reset": 1}]
+    q = [o["q"] for o in run_stepped(Neg, steps, clock="clk", reset="reset", active=1, style="sync",
+                                     widths={"q": 8}, inputs={"d": 8, "reset": 1})]
+    assert q == [0x34, 0x7F, 0x7F, 0x7F, 0x34]   # the rising edge after reset rose leaves q alone; the falling one resets it

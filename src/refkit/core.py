@@ -1256,7 +1256,7 @@ def run_stepped(
     previous step and this one) runs the @seq blocks of that edge with the inputs of the PREVIOUS step; then this step's inputs
     are applied, an asynchronous reset acts, the @latch blocks run with them (transparent: their assignments take effect at
     once), and the outputs are read. Before the first step the clock and every input were 0. A synchronous reset asserted in the
-    previous step acts at the edge instead of the @seq blocks of that edge.
+    previous step acts at an edge that has @seq blocks, instead of those blocks.
     """
     m = _resolve(machine)
     if not isinstance(m, Module):
@@ -1280,7 +1280,9 @@ def run_stepped(
             blocks = [f for f in m._seq if getattr(f, "_refkit_edge", "pos") in edges]
             if blocks:
                 s = m._apply(s, m._change(s, previous, blocks, "seq"))
-            if spec is not None and spec.style == "sync" and _asserted(spec, previous):
+            # A synchronous reset acts on the edge the registers are clocked by, not on every edge of the clock: a block
+            # clocked on the falling edge does not see its reset at a rising one.
+            if blocks and spec is not None and spec.style == "sync" and _asserted(spec, previous):
                 s = _after_reset(m, s)
         if spec is not None and spec.style == "async" and _asserted(spec, x):
             s = _after_reset(m, s)
