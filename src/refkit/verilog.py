@@ -121,6 +121,9 @@ class _Sym:
         if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self":
             name = target.attr
             decl = self.ctx.decls.get(name)
+            if (self.mode == "comb" and isinstance(decl, rk.Reg) and isinstance(value, ast.Attribute)
+                    and isinstance(value.value, ast.Name) and value.value.id == "self" and value.attr == name):
+                return                                   # `self.q = self.q` for an output that is a register: a no-op
             if self.mode != "comb" or isinstance(decl, (rk.Reg, rk.State, rk.Mem)):
                 raise Unsupported(f"self.{name} = ... outside a @comb net assignment")
             width = decl.width if isinstance(decl, rk.Wire) else self.ctx.outputs.get(name)

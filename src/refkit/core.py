@@ -871,6 +871,18 @@ class _InstanceHandle:
 _MISSING = object()
 
 
+def _same_value(view: Any, name: str, value: Any) -> bool:
+    """Whether `value` is the register's own current value (writing an output-register to itself in @comb is a no-op)."""
+    try:
+        current = getattr(view, name)
+    except RefKitError:
+        return False
+    try:
+        return int(value) == int(current)
+    except (TypeError, ValueError):
+        return False
+
+
 class _FileMemory:
     """Contents loaded from a file (the harness gives the same words to the hardware): `self.memory[i]` is word i, as an int."""
 
@@ -1068,6 +1080,8 @@ class _Frame:
         m = object.__getattribute__(self, "_module")
         mode = object.__getattribute__(self, "_mode")
         decl = m._decls.get(name)
+        if isinstance(decl, Reg) and mode == "comb" and _same_value(self, name, value):
+            return                                       # `self.q = self.q` for an output that is a register: it already is
         if isinstance(decl, (Reg, State, Mem)):
             raise RefKitError(
                 f"self.{name} = ... : {name} is a register; assign it in a @seq block with self.{name}.next = ... "

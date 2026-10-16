@@ -480,3 +480,28 @@ def test_transition_walk_takes_every_transition():
     cycles, cov = transition_walk(src)
     assert cov == {"states": 3, "transitions": 6, "covered": 6}
     assert cycles[0]["rst"] == 1 and all(set(c) == {"en", "rst"} for c in cycles)
+
+
+def test_an_output_register_assigned_to_itself_in_comb_is_a_no_op():
+    class Echo(Module):
+        q = Reg(4)
+
+        @seq
+        def count(self):
+            self.q.next = self.q + 1
+
+        @comb
+        def out(self):
+            self.q = self.q
+
+    assert [o["q"] for o in run(Echo, [{"en": 0}] * 3, widths={"q": 4})] == [0, 1, 2]
+
+    class Clash(Module):
+        q = Reg(4)
+
+        @comb
+        def out(self):
+            self.q = self.q + 1
+
+    with pytest.raises(RefKitError, match="is a register"):
+        run(Clash, [{"en": 0}], widths={"q": 4})

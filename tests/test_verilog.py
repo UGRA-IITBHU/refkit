@@ -122,3 +122,10 @@ def test_proof_with_an_asynchronous_reset(tmp_path):
     assert prove(source, rtl, "TopModule", "clk", workdir=tmp_path / "a").status == "proven"
     sync_rtl = rtl.replace(" or posedge areset", "")
     assert prove(source, sync_rtl, "TopModule", "clk", workdir=tmp_path / "s").status == "refuted"   # a synchronous reset is wrong here
+
+
+def test_an_output_register_assigned_to_itself_translates_as_the_register():
+    source = COUNTER.replace("    cnt = Reg(4)", "    cnt = Reg(4)\n    q = Reg(4)").replace(
+        "            self.cnt.next = self.cnt + 1", "            self.cnt.next = self.cnt + 1\n            self.q.next = self.q + 1").replace(
+        "        self.q = self.cnt", "        self.q = self.q")
+    assert "output reg [3:0] q" in translate(source).verilog

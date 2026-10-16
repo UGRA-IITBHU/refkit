@@ -8,6 +8,8 @@ handle the ordinary reset, and never mask a value to a width: RefKit does those.
 
 Everything you can use is listed in **API** below. Nothing else exists: do not invent functions, methods or arguments.
 
+Start every reference with `from refkit import *`, which imports all of these:
+
 ```python
 from refkit import Module, Reg, State, Wire, Mem, Input, Output, Instance, seq, comb, latch, B, cat, mux, casez, clog2
 ```
@@ -15,7 +17,7 @@ from refkit import Module, Reg, State, Wire, Mem, Input, Output, Instance, seq, 
 ## The shape of a reference
 
 ```python
-from refkit import Module, Reg, Wire, seq, comb, B, cat
+from refkit import *
 
 class Ref(Module):
     count = Reg(4)              # reg [3:0] count;          reset value 0
@@ -46,7 +48,8 @@ class Ref(Module):
 - Inside a block, `self.name` is: an input port, a register (its value now), a wire or an output already set. A port named like a
   Python keyword (`in`) is `self.in_`.
 - Every output port must be set by a @comb block in every cycle, **unless** a `Reg` has the output's name: then the output is that
-  register (Verilog `output reg q`).
+  register (Verilog `output reg q`). **Do not also assign it in @comb** (`self.q = ...`): the register already is the output;
+  give it its value with `self.q.next = ...` in @seq.
 
 ## The timeline (get this right and the rest follows)
 
@@ -358,7 +361,7 @@ class Ref(Module):
     @seq
     def shift(self):
         if self.en:
-            self.sr.next = cat(self.sr[6:0], self.din)    # shift left, new bit in at bit 0 (MSB first arrives at the top)
+            self.sr.next = cat(self.sr[6:0], self.din)    # shift left: old bits move up one, the new bit enters at bit 0
             # shift right, new bit in at the top:  cat(self.din, self.sr[7:1])
 
     @comb
