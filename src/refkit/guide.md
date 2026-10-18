@@ -6,6 +6,10 @@ RefKit is a small Python library that behaves like a Verilog module. You write t
 rules: non-blocking assignments, bit widths that wrap, the reset applied for you. You never write the loop over cycles, never
 handle the ordinary reset, and never mask a value to a width: RefKit does those.
 
+It is ordinary Python: local variables, `if`, `match`, `for`, helper methods and plain integers all work. Where Verilog makes
+you think about bit positions, RefKit gives you a name that says what happens instead (`shift_in_low`, `shift_in_high`), so
+write those rather than reassembling the bits yourself.
+
 Everything you can use is listed in **API** below. Nothing else exists: do not invent functions, methods or arguments.
 
 Start every reference with `from refkit import *`, which imports all of these:
@@ -39,6 +43,9 @@ class Ref(Module):
 ```
 
 - One class, subclassing `Module`. Its name does not matter.
+- **Comment as you write**: beside each state or register, what it means (what has been seen, what the block is doing);
+  beside each branch, the case of the description it handles. Every case the description gives, inputs that are 1 at the
+  same time included, gets its own branch.
 - **Declarations** are class attributes: `Reg`, `State`, `Mem` (things that hold a value across clock edges) and `Wire`
   (internal combinational signals). Output ports and input ports are **not** declared: they come from the block's interface.
 - **`@comb` blocks** compute wires and output ports from inputs, registers and earlier wires: `self.y = expression`. They run
@@ -77,6 +84,12 @@ How to decide for each output:
 | "Moore machine": outputs depend on the state only | set it in `@comb` from the state register only, never from inputs |
 | "Mealy machine": outputs depend on the state and the inputs | set it in `@comb` from the state and the inputs |
 
+- **An output that reports an event** (a pattern completed, a frame received, a count reached, a request granted) is either
+  Mealy, high in the same cycle as the input that completes the event, or Moore, high in the cycle after, because the event is
+  first recorded in the state. Read which one the description asks for. When it calls the machine Moore, or says the output
+  depends on the state only, the output cannot react to an input in the same cycle: it changes one cycle after the input that
+  caused it.
+
 ## Reset
 
 The harness tells RefKit which input is the reset, whether it is active high or low, and whether it is synchronous or asynchronous.
@@ -87,8 +100,9 @@ RefKit puts **every** register (and every memory word) back to its declared rese
 
 So **do not** write `if self.reset:` for the ordinary reset. Give each register its reset value in the declaration
 (`Reg(4, reset=8)`, `State("IDLE", "RUN", reset="IDLE")`). Only when the description says the reset does something that is not
-"every register to its reset value" (for example, it loads an input into a register) write that in a `@seq` block; RefKit's reset
-still acts first.
+"every register to its reset value" (for example, it loads an input into a register, declared `reset=None`) write that in a
+`@seq` block; RefKit's reset still acts first. An assignment your code makes while the reset is asserted, to a register the reset
+puts back, has no effect, and RefKit reports it.
 
 Registers start at their reset values before the first cycle.
 
@@ -138,12 +152,27 @@ computation is:
   Verilog: in an assignment, the larger of the destination's width and the widest operand. So
   `self.sum9 = self.a + self.b` (8-bit `a`, `b`, 9-bit `sum9`) keeps the carry, exactly like `assign sum9 = a + b;`, and an 8-bit
   destination drops it. `//` and `/` are both Verilog `/` (integer division).
+- **Give a width only where the description gives one.** `Reg()` with no width is the width of the output port of the same
+  name (an `output reg`), or else a 32-bit number that does not wrap in practice: right for a count of cycles, a number of
+  events, a length of time with no stated width. A width you invent wraps where the description does not.
 - **A plain Python integer is a Verilog unsized constant: 32 bits.** `self.count + 1 == 16` is true for a 4-bit count at 15, as in
   Verilog. Use `B(value, width)` (Verilog `width'dvalue`) when the width matters, e.g. in `cat()`.
 - **Comparisons** (`== != < <= > >=`) compute both sides at the wider side's width and give `True`/`False`. They are unsigned.
   `~self.c == 0` is never true for a 4-bit `c`, just as in Verilog (`~c` is extended to 32 bits first); write `self.c == 15` or
   `self.c.reduce_and()`.
 - **Shifts** `<< >>` keep the left operand's width (in an assignment, the context width); `v.sra(n)` is `>>>` on a signed value.
+- **Shifting a bit in**: `v.shift_in_low(d)` is `{v[w-2:0], d}`: `d` enters at bit 0 and the old bits move up (the top one
+  drops out). `v.shift_in_high(d)` is `{d, v[w-1:1]}`: `d` enters at the top bit and the old bits move down (bit 0 drops out).
+  A wider `d` shifts in all its bits at once. Which one follows from the bit order of the data:
+
+  | Bits arrive | The first bit ends up in | Write |
+  |---|---|---|
+  | most significant bit first (MSB first) | the top bit | `self.r.shift_in_low(self.d)` |
+  | least significant bit first (LSB first) | bit 0 | `self.r.shift_in_high(self.d)` |
+
+- **Write a shift as one operation** (`>> n`, `<< n`, `shift_in_low`, `shift_in_high`), never as a `cat()` of every bit or one
+  line per bit; then change only the bits that differ from a plain shift, with an XOR or OR mask or `.set_bit(i, b)`. `>> 1`:
+  every bit takes the bit above it and the top becomes 0; `<< 1`: every bit takes the bit below it and bit 0 becomes 0.
 - **Selects**: `v[7:4]` (high bit first), `v[3]`, `v.part(base, w)` (`v[base +: w]`), `v.part_down(base, w)` (`v[base -: w]`).
 - **Concatenation and replication**: `cat(a, b, c)` is `{a, b, c}` (the first part is the most significant); every part must be
   sized, so write constants as `B(0, 1)`. `v.rep(n)` is `{n{v}}`.
@@ -152,6 +181,8 @@ computation is:
 - **Logical operators**: Verilog `&&`, `||`, `!` are Python `and`, `or`, `not`; `c ? a : b` is `mux(c, a, b)` (or Python
   `a if c else b`).
 - Assigning to a register, wire or output truncates or zero-extends to its width; `True`/`False` assign as 1/0.
+- In `@comb`, an output or a wire can be set bit by bit: `self.g[0] = ...`, `self.g[2:1] = ...` (every bit must be set in every
+  cycle). A register's bits change only at the edge: `self.r.next_bit(i, v)`.
 - `int(v)` is the number (use it to index a Python list or a range); `if v:` is true when `v` is not zero.
 
 ## Verilog to RefKit, construct by construct
@@ -160,7 +191,7 @@ computation is:
 |---|---|
 | `module m (input [7:0] a, output [7:0] y);` | `class Ref(Module):` (the ports come from the interface) |
 | `parameter W = 8;` / `localparam` | a class attribute `W = 8`, read as `self.W` |
-| `reg [W-1:0] r;` | `r = Reg(W)` |
+| `reg [W-1:0] r;` | `r = Reg(W)`; `Reg()` when the description gives no width (see Values) |
 | `reg [3:0] r = 4'd5;` / `initial r = 5;` | `r = Reg(4, init=5)` (value at power-up) |
 | a register the reset does not touch | `r = Reg(4, reset=None)` |
 | `reg [7:0] mem [0:15];` | `mem = Mem(16, 8)`; read `self.mem[i]`; write `self.mem.write(i, v)` in `@seq` |
@@ -174,6 +205,8 @@ computation is:
 | a latch: `always @(*) if (en) q = d;` | `@latch` with `self.q.next = self.d` under the condition |
 | `r <= v;` | `self.r.next = v` |
 | `r[3] <= 1'b1;` / `r[7:4] <= v;` | `self.r.next_bit(3, 1)` / `self.r.next_slice(7, 4, v)` |
+| `assign g[0] = ...;` | `self.g[0] = ...` in `@comb` |
+| `r <= {r[6:0], d};` / `r <= {d, r[7:1]};` | `self.r.next = self.r.shift_in_low(self.d)` / `self.r.shift_in_high(self.d)` |
 | `if / else if / else` | `if / elif / else` |
 | `case (s) 0: ...; 1, 2: ...; default: ...; endcase` | `match int(self.s): case 0: ... case 1 | 2: ... case _: ...` |
 | `casez (op) 4'b1??0: ...` / `casex` | `if casez(self.op, "1??0"): ... elif ...` |
@@ -195,7 +228,7 @@ arithmetic. A child module used as an `Instance` declares its ports with `Input(
 | Name | What it is |
 |---|---|
 | `Module` | base class of the reference |
-| `Reg(width, reset=0, init=None)` | a register; `self.r` reads it; `self.r.next = v`, `self.r.next_bit(i, b)`, `self.r.next_slice(hi, lo, v)` assign it at the edge; `reset=None`: the reset does not touch it; `init`: power-up value |
+| `Reg(width=None, reset=0, init=None)` | a register (no width: the output port's, or 32 bits); `self.r` reads it; `self.r.next = v`, `self.r.next_bit(i, b)`, `self.r.next_slice(hi, lo, v)` assign it at the edge; `reset=None`: the reset does not touch it; `init`: power-up value |
 | `State("A", "B", ..., reset="A")` | a state register holding one of the names; reset defaults to the first; `self.st == "A"`; `self.st.next = "B"`; `self.st.value` (the name, for `match`) |
 | `Mem(depth, width, reset=0)` | `depth` words; `self.m[addr]` reads; `self.m.write(addr, v)` writes at the edge; `len(self.m)`; `reset=None`: not cleared by the reset |
 | `Wire(width)` | an internal combinational signal, set in `@comb` with `self.w = v` |
@@ -208,15 +241,18 @@ arithmetic. A child module used as an `Instance` declares its ports with `Input(
 | `cat(a, b, ...)`, `mux(c, a, b)`, `casez(v, "1?0")`, `clog2(n)` | concatenation, `?:`, casez matching, `$clog2` |
 | `v[hi:lo]`, `v[i]`, `v.part(base, w)`, `v.part_down(base, w)` | selects |
 | `v.zext(w)`, `v.sext(w)`, `v.rep(n)`, `v.set_bit(i, b)`, `v.set_slice(hi, lo, x)` | resize, replicate, copies with bits replaced |
+| `v.shift_in_low(d)`, `v.shift_in_high(d)` | `v` with `d` shifted in at bit 0 (old bits move up) / at the top (old bits move down) |
 | `v.signed`, `v.slt/sle/sgt/sge(o)`, `v.sdiv/smod/smul(o)`, `v.sra(n)` | signed meaning, comparisons and arithmetic |
 | `v.reduce_and()` ... `v.reduce_xnor()`, `a.xnor(b)` | reductions, `~^` |
 | `v.width`, `int(v)` | the width; the number |
 | `examples = [...]` | optional: cycle-by-cycle values the description gives (pattern "Waveforms and tables of values") |
 
 Errors RefKit reports, so you know what is not allowed: assigning a register with `self.r = v` (use `.next`), `.next` outside
-`@seq`/`@latch`, setting an output or wire inside `@seq`, reading a wire before the block that sets it, a name that is not an
+`@seq`/`@latch`, `.next` on an input port (the block cannot change an input; a value it keeps is a `Reg`), setting an output or
+wire inside `@seq`, reading a wire before the block that sets it, an output with some bits never set, a name that is not an
 input, register, wire, output, parameter or function, an output port no block sets, `v[3:7]` (write the high bit first), `cat` of
-a plain integer, a negedge/dual-edge/latch module run without step mode.
+a plain integer, an assignment the reset overrides (the ordinary reset written by hand), a negedge/dual-edge/latch module run
+without step mode.
 
 ## Combinational blocks
 
@@ -239,7 +275,7 @@ class Ref(Module):
 ## Checklist before you answer
 
 1. Every value the description says is stored or remembered (a register, a counter, a state, a previous value, a shift register,
-   a memory) is declared, with the width and reset value the description gives.
+   a memory) is declared, with the width and reset value the description gives; `Reg()` where it gives no width.
 2. For each output: same cycle (`@comb`) or one cycle later (a register)? Check it against the timeline and the table above.
 3. For a state machine: every state the description names, every transition in the order the description gives it, and what
    happens when no condition holds (normally: stay).
@@ -247,6 +283,11 @@ class Ref(Module):
    Count on paper: write out cycles 0, 1, 2, 3 of a short input sequence and the values you expect.
 5. No `if self.reset` for the ordinary reset.
 6. Every output port set in every cycle (or a `Reg` with its name).
+7. Shifts: one operation each, in the direction the bit order gives (MSB first: `shift_in_low`; LSB first: `shift_in_high`).
+8. Outputs that report an event: same cycle as the completing input (Mealy) or the cycle after (Moore)?
+9. An output register that is not assigned in some cycle keeps its value; a one-cycle pulse is cleared every cycle.
+10. Latency: count the registers between the input and the output and compare with the cycles the description gives.
+11. Special cases the description lists are separate branches, tested first and in its order.
 
 <!-- COOKBOOK -->
 
@@ -278,6 +319,36 @@ class Ref(Module):
 - Down counters: `self.count - 1` goes from 0 to the maximum by itself.
 - Decide whether "done"/"terminal count" is high **while** the count has its last value (`@comb`, as above) or **in the cycle
   after** it reached it (a `Reg`).
+- A count with no width in the description is `Reg()`: it does not wrap.
+- **Cascaded counters** (digits of a decimal count, units of time, a prescaler and the counter it drives): a counter steps only
+  in the edge in which every counter below it wraps. Name each counter's step condition first, from the step of the counter
+  below and that counter's value; never gate a higher counter with the enable alone:
+
+```python
+class Ref(Module):
+    ones = Reg(4)
+    tens = Reg(4)
+    hundreds = Reg(4)
+
+    @seq
+    def step(self):
+        ones_step = self.en                                  # the lowest counter steps on every enabled edge
+        tens_step = ones_step and self.ones == 9             # tens: only in the edge in which the ones wrap 9 -> 0
+        hundreds_step = tens_step and self.tens == 9         # hundreds: only when the tens wrap too
+        if ones_step:
+            self.ones.next = 0 if self.ones == 9 else self.ones + 1
+        if tens_step:
+            self.tens.next = 0 if self.tens == 9 else self.tens + 1
+        if hundreds_step:
+            self.hundreds.next = 0 if self.hundreds == 9 else self.hundreds + 1
+
+    @comb
+    def out(self):
+        self.q = cat(self.hundreds, self.tens, self.ones)    # three decimal digits, 000 to 999
+```
+
+- A counter whose range does not start at 0 (1 to N, or a range that wraps to 1): write both ends explicitly
+  (`1 if self.c == N else self.c + 1`), and check the reset value against the range.
 
 ## Pattern: state machine (Moore)
 
@@ -334,8 +405,8 @@ Use when: the block raises an output when a given pattern of input bits has been
 - Decide from the description: does the output come in the same cycle as the last bit of the pattern (Mealy, `@comb` using the
   input) or in the cycle after (Moore: a state "FOUND" entered on the last bit)?
 - Overlapping: after a match, the bits already seen can be the start of the next match. Unless the description says the
-  detector starts over, keep the longest suffix of what was seen that is still a prefix of the pattern. A shift register of the
-  last N bits is often the simplest and clearest model:
+  detector starts over, keep the longest suffix of what was seen that is still a prefix of the pattern.
+- The pattern can be followed with states (one per prefix seen so far) or with a shift register of the last bits:
 
 ```python
 class Ref(Module):
@@ -343,11 +414,11 @@ class Ref(Module):
 
     @seq
     def shift(self):
-        self.last.next = cat(self.last[1:0], self.x)
+        self.last.next = self.last.shift_in_low(self.x)
 
     @comb
     def detect(self):
-        self.found = cat(self.last[1:0], self.x) == 0b101    # Mealy: the current bit completes "101"
+        self.found = cat(self.last, self.x) == 0b0110    # Mealy: the current bit completes "0110"
 ```
 
 ## Pattern: shift register and serial-to-parallel
@@ -361,8 +432,8 @@ class Ref(Module):
     @seq
     def shift(self):
         if self.en:
-            self.sr.next = cat(self.sr[6:0], self.din)    # shift left: old bits move up one, the new bit enters at bit 0
-            # shift right, new bit in at the top:  cat(self.din, self.sr[7:1])
+            self.sr.next = self.sr.shift_in_low(self.din)    # the new bit enters at bit 0, old bits move up
+            # or self.sr.shift_in_high(self.din)              (the new bit enters at the top, old bits move down)
 
     @comb
     def out(self):
@@ -370,48 +441,34 @@ class Ref(Module):
         self.dout = self.sr[7]
 ```
 
-- "Least significant bit first": the first bit received ends up in bit 0 of the word, so shift right with the new bit entering at
-  the top (`cat(self.din, self.sr[7:1])`), and after 8 bits the first one is in bit 0.
+- The bit order decides the helper: MSB first, the first bit received must end in the top bit, so it enters at bit 0 and moves
+  up (`shift_in_low`); LSB first, it must end in bit 0, so it enters at the top and moves down (`shift_in_high`).
+- A serial output sends the bit at the end the data leaves from: the top bit for MSB first, bit 0 for LSB first.
 
-## Pattern: serial receiver with a bit counter
+## Pattern: linear feedback shift register (LFSR)
 
-Use when: a machine waits for a start condition, collects N bits, checks a stop condition, then reports.
+Use when: the description gives an LFSR (Fibonacci or Galois), taps, or a polynomial.
+
+- Tap positions are usually numbered from 1 at the least significant bit, so a tap at position n is bit n-1; a polynomial
+  x^n + x^k + 1 has taps at n and k.
+- **Galois** (internal XORs, shifting right): shift right; when the bit shifted out (bit 0) is 1, XOR the tap mask into the
+  shifted value. The top bit, a tap, receives the bit shifted out.
+- **Fibonacci** (external XOR): the new bit is the XOR of the tapped bits, shifted in at one end.
 
 ```python
 class Ref(Module):
-    st = State("IDLE", "DATA", "STOP", "DONE", "ERR")
-    n = Reg(4)
-    data = Reg(8)
+    r = Reg(4, reset=1)                       # an LFSR must not start at 0: it would stay 0
 
     @seq
-    def fsm(self):
-        if self.st == "IDLE":
-            if self.rx == 0:                          # start bit
-                self.st.next = "DATA"
-                self.n.next = 0
-        elif self.st == "DATA":
-            self.data.next = cat(self.rx, self.data[7:1])     # LSB first
-            self.n.next = self.n + 1
-            if self.n == 7:
-                self.st.next = "STOP"
-        elif self.st == "STOP":
-            self.st.next = "DONE" if self.rx == 1 else "ERR"
-        elif self.st == "DONE":
-            self.st.next = "DATA" if self.rx == 0 else "IDLE"   # a start bit right away
-            self.n.next = 0
-        elif self.st == "ERR":
-            if self.rx == 1:
-                self.st.next = "IDLE"
+    def step(self):
+        taps = B(0b1100, 4)                   # taps at positions 4 and 3: bits 3 and 2
+        shifted = self.r >> 1
+        self.r.next = (shifted ^ taps) if self.r[0] else shifted     # Galois: XOR the taps when a 1 falls out
 
     @comb
     def out(self):
-        self.done = self.st == "DONE"
-        self.byte = self.data
+        self.q = self.r
 ```
-
-- Count the cycles: with `n` from 0 to 7 the DATA state lasts exactly 8 cycles. Write out the cycles of one byte on paper and
-  check in which cycle `done` is high.
-- What happens in the DONE cycle if a new start bit arrives is part of the description: read it, do not assume.
 
 ## Pattern: edge detection and a previous value
 
@@ -455,6 +512,9 @@ class Ref(Module):
 ```
 
 - Valid flags travel with the data: give each stage a `vN = Reg(1)` assigned from the previous stage's flag.
+- **Latency is the number of registers on the path.** A result "N cycles after the input" has N registers between the input and
+  the output: the input is read at cycle *t*, the output shows it at cycle *t+N*. Count the registers you wrote along the path
+  and compare with N before you answer. A flag that says the data is valid goes through the same number of registers as the data.
 
 ## Pattern: memory, register file, FIFO
 
@@ -490,6 +550,10 @@ class Ref(Module):
 
 - A read in `@comb` gives the word in the same cycle; "the data is available on the next clock" means a `Reg` loaded in `@seq`.
 - Writing and reading the same address in one cycle: a `@comb` read sees the old word (the write happens at the edge).
+- **A pointer into a stack, queue or buffer is one of two things**: the index of the next free slot (the count of items, when
+  items start at 0), or the index of the last item stored. Pick the one the description's reset value and its empty and full
+  conditions fit, use it the same way in every branch (a push writes there, then moves it; a pop moves it, then reads), and make
+  `empty` and `full` compare it with the values that mean no items and all items.
 
 ## Pattern: arithmetic with carry, signed values, accumulators
 
@@ -517,6 +581,136 @@ class Ref(Module):
 
 - Signed comparison: compare `.signed` values. Sign extension: `self.x.sext(16)`.
 - Overflow of a signed add: the operands have the same sign and the result's sign differs.
+- **Special cases first.** When the description names special inputs or results (a zero operand, overflow, an invalid or
+  infinite value, a rounding rule), each one is its own branch, tested in the order the description gives, before the general
+  path. Write the general path only for what is left.
+- **Widths of products and sums**: a product of an m-bit and an n-bit number needs m+n bits, and a sum of k numbers needs
+  enough bits for the carries. Size the destination for that, or the result wraps; take the narrower output as a slice of it.
+- Saturating counters (they stop at their ends instead of wrapping): `self.c.next = self.c + 1 if self.c != MAX else self.c`
+  and `self.c - 1 if self.c != 0 else self.c`. A table of them is a `Mem`; read and update the entry an index selects.
+
+## Pattern: framed serial receiver
+
+Use when: a line carries frames (a start condition, N data bits, possibly a parity bit, a stop condition) and the block
+reports each frame received, or one received wrongly.
+
+- One state per phase: waiting for the start, data (with a bit counter), parity, stop, and a state for a bad frame that waits for
+  the line to return to idle before looking for the next start.
+- Count the data cycles exactly: with the counter going from 0, the data phase lasts N cycles; write out one frame cycle by
+  cycle and check in which cycle each flag rises.
+- A flag that reports a frame (done, valid, error) is Mealy or Moore (see the timeline): decide from the description whether it
+  rises in the cycle of the stop bit or the cycle after, and what happens if the next start condition comes right after a frame.
+- Data bits are collected in the order the description gives (see the shift register pattern for MSB first / LSB first).
+
+## Pattern: arbiter
+
+Use when: several requesters share a resource and the block grants it to one.
+
+```python
+class Ref(Module):
+    st = State("IDLE", "G0", "G1", "G2")              # who holds the grant
+
+    @seq
+    def grant(self):
+        if self.st == "IDLE":                         # fixed priority: requester 0 first
+            if self.r[0]:
+                self.st.next = "G0"
+            elif self.r[1]:
+                self.st.next = "G1"
+            elif self.r[2]:
+                self.st.next = "G2"
+        elif self.st == "G0" and not self.r[0]:      # a grant is held while its request stays high
+            self.st.next = "IDLE"
+        elif self.st == "G1" and not self.r[1]:
+            self.st.next = "IDLE"
+        elif self.st == "G2" and not self.r[2]:
+            self.st.next = "IDLE"
+
+    @comb
+    def out(self):
+        self.g[0] = self.st == "G0"
+        self.g[1] = self.st == "G1"
+        self.g[2] = self.st == "G2"
+```
+
+- Round robin: keep the last requester granted in a register and search from the one after it.
+- Whether a grant can pass directly from one requester to another, or goes back to idle in between, is part of the description.
+
+## Pattern: operation that takes several cycles (start, busy, done)
+
+Use when: a result needs a fixed number of clock cycles (a shift-and-add multiplier, a divider, a serial transmitter), with a
+start input and a done or valid output.
+
+```python
+class Ref(Module):
+    acc = Reg(16)                                  # partial result: kept until the next start
+    mcand = Reg(16)
+    mplier = Reg(8)
+    cnt = Reg(4)
+    busy = Reg(1)
+    done = Reg(1)
+
+    @seq
+    def step(self):
+        self.done.next = 0                         # done is high for one cycle
+        if self.start and not self.busy:           # take the operands, begin
+            self.mcand.next = self.a.zext(16)
+            self.mplier.next = self.b
+            self.acc.next = 0
+            self.cnt.next = 0
+            self.busy.next = 1
+        elif self.busy:                            # one step per cycle
+            if self.mplier[0]:
+                self.acc.next = self.acc + self.mcand
+            self.mcand.next = self.mcand << 1
+            self.mplier.next = self.mplier >> 1
+            self.cnt.next = self.cnt + 1
+            if self.cnt == 7:                      # the last step: the result is in acc from the next cycle
+                self.busy.next = 0
+                self.done.next = 1
+
+    @comb
+    def out(self):
+        self.product = self.acc
+        self.ready = self.done
+```
+
+- Latch the operands when the operation starts: the inputs may change while it runs.
+- Count the steps on paper: with N steps, `done` is high in the cycle after the Nth step, and the result is stable from then until
+  the next start.
+- What the outputs show while the operation runs (the old result, zero, a partial value) follows the description. A register that
+  nothing assigns outside the operation keeps its last value.
+
+## Pattern: clock divider and generated clocks
+
+Use when: an output is a slower clock or a pulse train derived from the input clock.
+
+A RefKit module has one clock. A clock the block makes is an ordinary output, a register that toggles: it is data, not a clock
+of the module.
+
+```python
+class Ref(Module):
+    cnt = Reg(2)
+    slow = Reg(1)                                  # the divided clock, an output register
+
+    @seq
+    def divide(self):
+        if self.cnt == 1:                          # half a period is 2 input cycles: divide by 4
+            self.cnt.next = 0
+            self.slow.next = ~self.slow
+        else:
+            self.cnt.next = self.cnt + 1
+
+    @comb
+    def out(self):
+        self.clk_out = self.slow
+```
+
+- Count input cycles: divide by N (even) toggles every N/2 input cycles; a pulse once every N cycles is a counter that wraps at N-1.
+- An odd N with an equal high and low time needs both edges: a rising-edge register and a falling-edge register combined (see the
+  negedge pattern).
+- Which level the output starts at, and in which cycle the first toggle happens, come from the description's reset value and its
+  waveform; write them as given.
 
 ## Pattern: waveforms and tables of values
 
@@ -547,6 +741,11 @@ Use when: registers change only under some condition.
 
 - A register not assigned in an edge keeps its value: write nothing for the "hold" case.
 - Priority between conditions (reset > load > enable > hold) is the order of an `if / elif` chain, as in Verilog.
+- **An output register assigned only under a condition keeps its last value when the condition is false** (until the reset). Do
+  not add an `else` that clears it unless the description says it returns to a default; "idle" and "otherwise" describe a
+  value only when the description names one.
+- The opposite case: an output that is high for **one cycle** per event must be written every cycle. Start the block with
+  `self.pulse.next = 0` and set it to 1 under the condition (the last assignment wins), or it stays high.
 
 ## Pattern: one-hot and encoded state outputs
 

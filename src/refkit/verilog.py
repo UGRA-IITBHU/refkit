@@ -32,6 +32,10 @@ class Unsupported(Exception):
     """A construct the translator does not cover: no proof is attempted."""
 
 
+class _Continue(Exception):
+    """A `continue` known at translation time (inside an unrolled loop, outside any hardware branch)."""
+
+
 @dataclass
 class E:
     """A Verilog expression with its self-determined width; `boolean` marks a 1-bit truth value (a comparison, `!`, `&&`)."""
@@ -72,6 +76,9 @@ class _Sym:
         self.next: dict[str, E] = {}                  # seq: register -> next value
         self.mem_writes: list[tuple[str, E, E, E]] = []  # (memory, condition, address, value)
         self.condition: E = E("1'b1", 1, True)
+        self.bits_set: dict[str, int] = {}              # comb: net -> the bits set on the current path
+        self.hw_depth = 0                               # hardware (non-constant) branches open at this point
+        self.loop_depths: list[int] = []                # hw_depth at the entry of each loop being unrolled
 
     # ── statements ──
     def run(self, body: list[ast.stmt]) -> None:
@@ -97,8 +104,16 @@ class _Sym:
             self.locals[st.target.id] = self.expr(ast.BinOp(st.target, st.op, st.value))
             return
         if isinstance(st, ast.If):
+            known = self.static(st.test)
+            if known is not None:
+                self.run(st.body if known else st.orelse)
+                return
             self.branch(self.cond(st.test), st.body, st.orelse)
             return
+        if isinstance(st, ast.Continue):
+            if not self.loop_depths or self.loop_depths[-1] != self.hw_depth:
+                raise Unsupported("a continue under a condition that depends on the inputs or registers")
+            raise _Continue()
         if isinstance(st, ast.Match):
             self.match(st)
             return
@@ -144,9 +159,36 @@ class _Sym:
             else:
                 self.set_next(reg, self.expr(value), decl.width)
             return
+        if (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Attribute)
+                and isinstance(target.value.value, ast.Name) and target.value.value.id == "self" and self.mode == "comb"):
+            self.set_net_bits(target.value.attr, target.slice, value)
+            return
         raise Unsupported(f"assignment to {ast.unparse(target)}")
 
+    def set_net_bits(self, name: str, index: ast.expr, value: ast.expr) -> None:
+        """`self.g[i] = v` / `self.g[hi:lo] = v` in @comb: those bits of the net, the others as they are on this path."""
+        decl = self.ctx.decls.get(name)
+        if isinstance(decl, (rk.Reg, rk.State, rk.Mem)):
+            raise Unsupported(f"self.{name}[...] = ... on a register")
+        width = decl.width if isinstance(decl, rk.Wire) else self.ctx.outputs.get(name)
+        if width is None:
+            raise Unsupported(f"self.{name} is not a wire or an output")
+        if isinstance(value, ast.Constant) and value.value is None:
+            raise Unsupported("a don't-care (None) output")
+        if isinstance(index, ast.Slice):
+            hi, lo = self.int_of(index.lower), self.int_of(index.upper)  # type: ignore[arg-type]
+        else:
+            hi = lo = self.int_of(index)
+        current = self.assigned.get(name)
+        if isinstance(current, _Partial):
+            raise Unsupported(f"bits of {name} set after the whole of it on some paths only")
+        base = current if current is not None else E(f"{width}'d0", width)
+        new = _splice(base, hi, lo, _fit(self.expr(value), hi - lo + 1), width)
+        self.assigned[name] = new if self.condition.text == "1'b1" else _mux(self.condition, new, base, width)
+        self.bits_set[name] = self.bits_set.get(name, 0) | (((1 << (hi - lo + 1)) - 1) << lo)
+
     def set_net(self, name: str, e: E, width: int) -> None:
+        self.bits_set[name] = (1 << width) - 1
         fitted = _fit(e, width)
         old = self.assigned.get(name)
         self.assigned[name] = fitted if old is None or self.condition.text == "1'b1" else _mux(self.condition, fitted, old, width)
@@ -188,14 +230,22 @@ class _Sym:
         if c.text == "1'b0":
             self.run(orelse)
             return
-        saved_cond, saved_locals = self.condition, dict(self.locals)
+        saved_cond, saved_locals, saved_bits = self.condition, dict(self.locals), dict(self.bits_set)
+        self.hw_depth += 1
+        try:
+            self._both_paths(c, then, orelse, saved_cond, saved_locals, saved_bits)
+        finally:
+            self.hw_depth -= 1
+
+    def _both_paths(self, c: E, then: list[ast.stmt], orelse: list[ast.stmt], saved_cond: E, saved_locals: dict, saved_bits: dict) -> None:
         self.condition = _and(saved_cond, c)
         self.run(then)
-        then_locals = self.locals
-        self.locals = dict(saved_locals)
+        then_locals, then_bits = self.locals, self.bits_set
+        self.locals, self.bits_set = dict(saved_locals), dict(saved_bits)
         self.condition = _and(saved_cond, _not(c))
         self.run(orelse)
-        else_locals = self.locals
+        else_locals, else_bits = self.locals, self.bits_set
+        self.bits_set = {n: then_bits.get(n, 0) & else_bits.get(n, 0) for n in set(then_bits) | set(else_bits)}
         self.condition = saved_cond
         merged = {}
         for name in set(then_locals) | set(else_locals):
@@ -204,14 +254,18 @@ class _Sym:
                 merged[name] = a
             elif a is _MISSING or b is _MISSING:
                 continue                                  # defined on one path only: reading it later is an error in Python too
-            elif isinstance(a, E) and isinstance(b, E):
+            elif not isinstance(a, E) and not isinstance(b, E) and a == b:
+                merged[name] = a
+            elif _as_e(a) is not None and _as_e(b) is not None:
+                # an expression on one path and an expression or a constant on the other (a Python number that differs between the
+                # paths becomes a 32-bit unsized constant, as it is when it is used)
+                a, b = _as_e(a), _as_e(b)
                 w = max(a.width, b.width)
-                merged[name] = E(f"({c.text} ? {a.text} : {b.text})", w, a.boolean and b.boolean,
-                                 a.width_sensitive or b.width_sensitive)
+                joined = E(f"({c.text} ? {a.text} : {b.text})", w, a.boolean and b.boolean, a.width_sensitive or b.width_sensitive)
                 if a.width != b.width:
                     self.ctx.notes.append(f"local {name} has widths {a.width} and {b.width} on two paths")
-            elif a == b:
-                merged[name] = a
+                # a value joined again and again (a running total over many cells) is held in a wire, or its text doubles each time
+                merged[name] = E(_temp(joined), w, joined.boolean, joined.width_sensitive) if len(joined.text) > 160 else joined
             else:
                 raise Unsupported(f"local {name} is a Python value that differs between branches")
         self.locals = merged
@@ -247,13 +301,44 @@ class _Sym:
         raise Unsupported(f"case pattern {ast.unparse(p)}")
 
     def loop(self, st: ast.For) -> None:
-        if not (isinstance(st.iter, ast.Call) and isinstance(st.iter.func, ast.Name) and st.iter.func.id == "range"
-                and isinstance(st.target, ast.Name) and not st.orelse):
-            raise Unsupported("a for loop that is not over range(...)")
-        bounds = [self.int_of(a) for a in st.iter.args]
-        for i in range(*bounds):
-            self.locals[st.target.id] = i
-            self.run(st.body)
+        if not (isinstance(st.target, ast.Name) and not st.orelse):
+            raise Unsupported("a for loop that is not over range(...) or a list of constants")
+        if isinstance(st.iter, ast.Call) and isinstance(st.iter.func, ast.Name) and st.iter.func.id == "range":
+            values: list[Any] = list(range(*[self.int_of(a) for a in st.iter.args]))
+        elif isinstance(st.iter, (ast.List, ast.Tuple)):
+            values = [self.py(e) for e in st.iter.elts]
+        else:
+            raise Unsupported("a for loop that is not over range(...) or a list of constants")
+        self.loop_depths.append(self.hw_depth)
+        try:
+            for i in values:
+                self.locals[st.target.id] = i
+                try:
+                    self.run(st.body)
+                except _Continue:
+                    pass
+        finally:
+            self.loop_depths.pop()
+
+    def static(self, node: ast.expr) -> bool | None:
+        """Whether a condition is known at translation time (loop indexes and constants only): True, False, or None."""
+        try:
+            if isinstance(node, ast.Compare) and len(node.ops) == 1:
+                a, b = self.py(node.left), self.py(node.comparators[0])
+                ops = {ast.Eq: lambda: a == b, ast.NotEq: lambda: a != b, ast.Lt: lambda: a < b, ast.LtE: lambda: a <= b,
+                       ast.Gt: lambda: a > b, ast.GtE: lambda: a >= b}
+                return bool(ops[type(node.ops[0])]()) if type(node.ops[0]) in ops else None
+            if isinstance(node, ast.BoolOp):
+                values = [self.static(v) for v in node.values]
+                if isinstance(node.op, ast.And):
+                    return False if any(v is False for v in values) else True if all(v is True for v in values) else None
+                return True if any(v is True for v in values) else False if all(v is False for v in values) else None
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+                inner = self.static(node.operand)
+                return None if inner is None else not inner
+            return bool(self.py(node))
+        except (Unsupported, TypeError):
+            return None
 
     # ── expressions ──
     def value_of(self, node: ast.expr) -> Any:
@@ -370,9 +455,9 @@ class _Sym:
             op = " && " if isinstance(node.op, ast.And) else " || "
             return E("(" + op.join(p.text for p in parts) + ")", 1, True)
         if isinstance(node, ast.Compare):
-            if len(node.ops) != 1:
-                raise Unsupported("chained comparison")
-            return self.compare(node.left, node.ops[0], node.comparators[0])
+            operands = [node.left, *node.comparators]
+            parts = [self.compare(operands[i], op, operands[i + 1]) for i, op in enumerate(node.ops)]     # a < b < c is (a < b) and (b < c)
+            return parts[0] if len(parts) == 1 else E("(" + " && ".join(p.text for p in parts) + ")", 1, True)
         if isinstance(node, ast.IfExp):
             c, a, b = self.cond(node.test), self.expr(node.body), self.expr(node.orelse)
             if a.width != b.width and (a.width_sensitive or b.width_sensitive):
@@ -386,6 +471,10 @@ class _Sym:
         raise Unsupported(f"expression {type(node).__name__}: {ast.unparse(node)[:60]}")
 
     def compare(self, left: ast.expr, op: ast.cmpop, right: ast.expr) -> E:
+        if isinstance(op, (ast.In, ast.NotIn)) and isinstance(right, (ast.Tuple, ast.List, ast.Set)) and right.elts:
+            parts = [self.compare(left, ast.Eq(), e) for e in right.elts]
+            any_of = E("(" + " || ".join(p.text for p in parts) + ")", 1, True)
+            return any_of if isinstance(op, ast.In) else _not(any_of)
         # a state register compared with a name
         state = _state_ref(left)
         if state is not None and state in self.ctx.states:
@@ -475,6 +564,20 @@ class _Sym:
                 if w <= v.width:
                     return E(f"{_sel(v)}[{w - 1}:0]", w)
                 return E(f"{{{{{w - v.width}{{{_sel(v)}[{v.width - 1}]}}}}, {_sized(v)}}}", w)
+            if method in ("shift_in_low", "shift_in_high"):
+                try:
+                    new = E(f"1'b{int(self.py(args[0])) & 1}", 1)
+                except Unsupported:
+                    new = self.expr(args[0])
+                if method == "shift_in_low":
+                    return E(f"{v.width}'({{{_sized(v)}, {_sized(new)}}})", v.width)
+                return E(f"{v.width}'({{{_sized(new)}, {_sized(v)}}} >> {new.width})", v.width)
+            if method == "set_bit":
+                i = self.int_of(args[0])
+                return _splice(v, i, i, _fit(self.expr(args[1]), 1), v.width)
+            if method == "set_slice":
+                hi, lo = self.int_of(args[0]), self.int_of(args[1])
+                return _splice(v, hi, lo, _fit(self.expr(args[2]), hi - lo + 1), v.width)
             if method == "rep":
                 n = self.int_of(args[0])
                 return E(f"{{{n}{{{_sized(v)}}}}}", v.width * n)
@@ -523,6 +626,10 @@ class _Sym:
             c = self.cond(node.test)
             a, b = self.state_value(reg, node.body), self.state_value(reg, node.orelse)
             return E(f"({c.text} ? {a.text} : {b.text})", a.width)
+        # a state register read as a value: the same register (a hold), or another one with the same names
+        source = _state_ref(node)
+        if source is not None and source in self.ctx.states and self.ctx.states[source] == self.ctx.states[reg]:
+            return E(source, len(self.ctx.states[reg]).bit_length())
         name = self.py(node)
         if name not in self.ctx.states[reg]:
             raise Unsupported(f"state {name!r}")
@@ -566,6 +673,17 @@ def _pyop(op: ast.operator, a: int, b: int) -> int:
     return {ast.Add: lambda: a + b, ast.Sub: lambda: a - b, ast.Mult: lambda: a * b, ast.FloorDiv: lambda: a // b,
             ast.Mod: lambda: a % b, ast.Pow: lambda: a ** b, ast.LShift: lambda: a << b, ast.RShift: lambda: a >> b,
             ast.BitAnd: lambda: a & b, ast.BitOr: lambda: a | b, ast.BitXor: lambda: a ^ b}[type(op)]()
+
+
+def _as_e(v: Any) -> E | None:
+    """A local as an expression: an expression, or a Python number (a 32-bit unsized constant); anything else is not one."""
+    if isinstance(v, E):
+        return v
+    if isinstance(v, bool):
+        return E("1'b1" if v else "1'b0", 1, True)
+    if isinstance(v, int):
+        return _const(v)
+    return None
 
 
 def _num(e: E) -> str:
@@ -666,10 +784,12 @@ class Translation:
     verilog: str
     module: str
     notes: list[str]
+    edge: str = "posedge"
 
 
-def translate(source: str, module_name: str = "refkit_ref") -> Translation:
-    """The Verilog of a completed RefKit reference (one that carries `__refkit__`)."""
+def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "clk") -> Translation:
+    """The Verilog of a completed RefKit reference (one that carries `__refkit__`). `clock_name` is the name of the clock port of the
+    translated module (the block's own, e.g. `CLK`); the miter always uses `clk`."""
     ns: dict[str, Any] = {}
     try:
         exec(compile(source, "<reference>", "exec"), ns)  # noqa: S102
@@ -682,8 +802,10 @@ def translate(source: str, module_name: str = "refkit_ref") -> Translation:
     _TEMPS.clear()
     if not isinstance(cls, type) or not issubclass(cls, rk.Module):
         raise Unsupported("only Module references are translated")
-    if meta["clock"] is not None or cls.needs_steps:
-        raise Unsupported("step mode (falling edge, both edges, latches)")
+    edges = {getattr(f, "_refkit_edge", "pos") for f in cls._seq}
+    if cls._latch or "both" in edges or len(edges) > 1:
+        raise Unsupported("step mode (latches, both edges, or rising and falling edges in one module)")
+    edge_kw = "negedge" if edges == {"neg"} else "posedge"
     if cls._instances:
         raise Unsupported("instances")
     if "memory" in source and "self.memory" in source:
@@ -695,25 +817,28 @@ def translate(source: str, module_name: str = "refkit_ref") -> Translation:
     if cls not in _SOURCES:
         raise Unsupported("the module class was not found in the source")
     inputs, outputs = dict(meta["inputs"]), dict(meta["widths"])
-    ctx = _Ctx(cls, dict(cls._decls), inputs, outputs)
-    for name, decl in cls._decls.items():
+    # a Reg() declared without a width has the width of its output port, or 32 bits (as RefKit runs it)
+    decls = {n: (rk.Reg(outputs.get(n, rk.NUMBER_WIDTH), d.reset, d.init) if isinstance(d, rk.Reg) and d.width is None else d)
+             for n, d in cls._decls.items()}
+    ctx = _Ctx(cls, decls, inputs, outputs)
+    for name, decl in decls.items():
         if isinstance(decl, rk.State):
             ctx.states[name] = list(decl.names)
     combinational = bool(meta["combinational"])
     lines: list[str] = []
-    reg_outputs = {n for n in outputs if isinstance(cls._decls.get(n), rk.Reg)}
+    reg_outputs = {n for n in outputs if isinstance(decls.get(n), rk.Reg)}
     for n in reg_outputs:
-        if cls._decls[n].width != outputs[n]:
+        if decls[n].width != outputs[n]:
             raise Unsupported(f"output {n} is a register of another width")
-    ports = ([] if combinational else ["input clk"]) + [f"input {_rng(w)}{n}" for n, w in inputs.items()] + \
+    ports = ([] if combinational else [f"input {clock_name}"]) + [f"input {_rng(w)}{n}" for n, w in inputs.items()] + \
         [f"output {'reg ' if n in reg_outputs else ''}{_rng(w)}{n}"
-         + (f" = {w}'d{rk.mask(cls._decls[n].power_up, w)}" if n in reg_outputs else "") for n, w in outputs.items()]
+         + (f" = {w}'d{rk.mask(decls[n].power_up, w)}" if n in reg_outputs else "") for n, w in outputs.items()]
     lines.append(f"module {module_name} ({', '.join(ports)});")
     for name, states in ctx.states.items():
         width = len(states).bit_length()
         for i, s in enumerate(states):
             lines.append(f"  localparam [{width - 1}:0] {name.upper()}__{s} = {width}'d{i};")
-    for name, decl in cls._decls.items():
+    for name, decl in decls.items():
         if isinstance(decl, rk.Reg) and name not in reg_outputs:
             lines.append(f"  reg {_rng(decl.width)}{name} = {decl.width}'d{rk.mask(decl.power_up, decl.width)};")
         elif isinstance(decl, rk.State):
@@ -730,6 +855,9 @@ def translate(source: str, module_name: str = "refkit_ref") -> Translation:
         sym = _Sym(ctx, "comb")
         sym.run(_function_ast(cls, block.__name__).body)
         for name, e in sym.assigned.items():
+            width = ctx.outputs.get(name) or ctx.decls[name].width
+            if sym.bits_set.get(name, 0) != (1 << width) - 1:
+                raise Unsupported(f"some bits of {name} are not set on every path of a @comb block")
             if isinstance(e, _Partial):
                 raise Unsupported(f"{name} is not set on every path of a @comb block")
             if name in set_nets:
@@ -755,11 +883,11 @@ def translate(source: str, module_name: str = "refkit_ref") -> Translation:
         active = int(meta["active"])
         level = f"({_vname(reset)} == 1'b{active})" if reset is not None else None
         style = meta["style"]
-        resettable = {n for n, d in cls._decls.items()
+        resettable = {n for n, d in decls.items()
                       if (isinstance(d, rk.Reg) and d.reset is not None) or isinstance(d, rk.State)}
 
         def reset_value(name: str) -> str:
-            d = cls._decls[name]
+            d = decls[name]
             return f"{name.upper()}__{d.reset}" if isinstance(d, rk.State) else f"{d.width}'d{rk.mask(d.reset, d.width)}"
 
         nexts = [(reg, e) for reg, e in sym.next.items()]
@@ -769,7 +897,7 @@ def translate(source: str, module_name: str = "refkit_ref") -> Translation:
             edge = "posedge" if active == 1 else "negedge"
             fast = [(r, e) for r, e in nexts if r in resettable]
             if resettable:
-                lines.append(f"  always @(posedge clk or {edge} {_vname(reset)}) begin")
+                lines.append(f"  always @({edge_kw} {clock_name} or {edge} {_vname(reset)}) begin")
                 lines.append(f"    if {level} begin")
                 lines += [f"      {r} <= {reset_value(r)};" for r in sorted(resettable)]
                 lines.append("    end else begin")
@@ -778,7 +906,7 @@ def translate(source: str, module_name: str = "refkit_ref") -> Translation:
                 lines.append("  end")
             slow = [(r, e) for r, e in nexts if r not in resettable]
             if slow or sym.mem_writes:
-                lines.append("  always @(posedge clk) begin")
+                lines.append(f"  always @({edge_kw} {clock_name}) begin")
                 lines += [f"    {r} <= {e.text};" for r, e in slow]
                 lines += [f"    if ({c.text}) {m}[{a.text}] <= {v.text};" for m, c, a, v in sym.mem_writes]
                 lines.append("  end")
@@ -795,12 +923,12 @@ def translate(source: str, module_name: str = "refkit_ref") -> Translation:
                     body.append(f"    if {level} begin")
                     body += resets
                     body.append("    end")
-            lines.append("  always @(posedge clk) begin")
+            lines.append(f"  always @({edge_kw} {clock_name}) begin")
             lines += body
             lines.append("  end")
     lines.append("endmodule")
     out = lines[:declarations_end] + [d for d, _ in _TEMPS] + lines[declarations_end:-1] + [a for _, a in _TEMPS] + lines[-1:]
-    return Translation("\n".join(out) + "\n", module_name, ctx.notes)
+    return Translation("\n".join(out) + "\n", module_name, ctx.notes, edge_kw)
 
 
 def _rng(width: int) -> str:
@@ -912,6 +1040,8 @@ def prove(source: str, rtl: str, dut_module: str, clock: str | None, *, depth: i
         translation = translate(source)
     except Unsupported as why:
         return Proof("unsupported", f"the reference was not translated to Verilog: {why}")
+    if translation.edge != "posedge":
+        return Proof("unsupported", "the reference is clocked on the falling edge: the proof is not run")
     meta = rk._meta_of(source)
     sby = _tool("sby")
     if sby is None or meta is None:

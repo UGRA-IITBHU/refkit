@@ -3,7 +3,7 @@
 Reference models of hardware blocks, **written like Verilog, in Python**.
 
 - `refkit.core` (imported as `refkit`): the language. `Module`, `Reg`, `State`, `Mem`, `Wire`, `@seq`, `@comb`, `@latch`,
-  `Bits` with Verilog's width rules, run cycle by cycle (`run`, `run_stepped`), compared exactly (`compare`), walked through every
+  `Bits` with Verilog's width rules (and `shift_in_low` / `shift_in_high`, which name where a shifted bit enters), run cycle by cycle (`run`, `run_stepped`), compared exactly (`compare`), walked through every
   transition (`transition_walk`).
 - `refkit.verilog`: translates a RefKit module into Verilog and proves an RTL module equivalent to it with SymbiYosys
   (`translate`, `prove`).

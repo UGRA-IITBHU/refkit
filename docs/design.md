@@ -63,8 +63,15 @@ Highlights:
   (`Instance` with `Input`/`Output` declarations), `match` for `case`, `casez()`, `mux()`, `clog2()`, signed operations.
 - **Reset**: applied by RefKit from the block's interface (sync or async, active high or low) to every register with a reset
   value; `Reg(w, reset=None)` is a register the reset does not touch, `init=` its power-up value.
+- **Written for the model, not for Verilog**: the constructs a model got wrong on the dev half have a form that says what
+  happens. `v.shift_in_low(d)` / `v.shift_in_high(d)` name where the new bit enters; hand-written `cat()` shifts flipped the
+  bit order. The guide teaches the language only: no advice written from a benchmark problem's description or answer. `Reg()` without a width is the output port's width, or 32
+  bits; a width the model invented wrapped where the description had none. `self.g[0] = ...` sets bits of an output in `@comb`,
+  as Verilog's `assign g[0] = ...` does.
 - **Checks on the model's own code**: an undeclared name, a register assigned without `.next`, an output never set, a `moore = True`
-  claim that is false, an `examples` waveform from the description the module does not reproduce. Any of these raises with a
+  claim that is false, an `examples` waveform from the description the module does not reproduce, `.next` on an input port, an output with some bits
+never set, and an assignment made while the reset is asserted that the reset overrides, in a block that reads the reset port (the
+ordinary reset written by hand, disagreeing with the declaration or with the reset's polarity). Any of these raises with a
   message that says what to write instead; the reference model gets one fix call showing only its own code and the error
   (`BlindReference.fixOwnError`), so the reference stays blind to the RTL.
 
