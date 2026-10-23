@@ -323,3 +323,106 @@ __refkit__ = {"module": Ref, "combinational": False, "clock": None, "reset": "rs
 
 def test_a_state_register_assigned_to_itself_holds_its_value():
     _cosim(STATE_HOLD)
+
+
+# ─── translations checked by simulation against RefKit's own run ────────────────────────────────────────────────────────
+
+from refkit import run  # noqa: E402
+from refkit.verilog import cosimulate  # noqa: E402
+
+have_icarus = _tool("iverilog") is not None and _tool("vvp") is not None
+
+
+def ref(body: str, inputs: dict, widths: dict, combinational: bool = False, reset: str | None = "rst") -> str:
+    return (f"from refkit import *\nclass Ref(Module):\n{body}\n__refkit__ = {{\"module\": Ref, \"combinational\": {combinational}, "
+            f"\"clock\": None, \"reset\": {reset!r}, \"active\": 1, \"style\": \"sync\", \"widths\": {widths!r}, \"inputs\": {inputs!r}}}\n")
+
+
+def same_as_run(source: str, cycles: list[dict]) -> None:
+    ns: dict = {}
+    exec(source, ns)
+    meta = ns["__refkit__"]
+    want = run(meta["module"], cycles, reset=meta["reset"], active=meta["active"], style=meta["style"], widths=meta["widths"],
+               inputs=meta["inputs"])
+    assert cosimulate(source, cycles) == want
+
+
+def every(widths: dict, n: int = 64, extra: dict | None = None) -> list[dict]:
+    import random
+    r = random.Random(7)
+    return [{**{k: r.randrange(1 << w) for k, w in widths.items()}, **(extra or {})} for _ in range(n)]
+
+
+@pytest.mark.skipif(not have_icarus, reason="Icarus Verilog not installed")
+def test_shift_by_an_amount_of_this_cycle():
+    src = ref("""    @comb
+    def o(self):
+        self.l = self.a << int(self.s)
+        self.r = self.a >> self.s
+        self.one = B(1, 16) << self.s
+""", {"a": 8, "s": 4}, {"l": 8, "r": 8, "one": 16}, combinational=True, reset=None)
+    same_as_run(src, every({"a": 8, "s": 4}))
+
+
+@pytest.mark.skipif(not have_icarus, reason="Icarus Verilog not installed")
+def test_set_bit_at_an_index_of_this_cycle_and_a_net_read_after_it_is_set():
+    src = ref("""    @comb
+    def o(self):
+        self.be = B(0, 4)
+        if self.en:
+            self.be = self.be.set_bit(self.i, 1)
+""", {"en": 1, "i": 2}, {"be": 4}, combinational=True, reset=None)
+    same_as_run(src, every({"en": 1, "i": 2}))
+
+
+@pytest.mark.skipif(not have_icarus, reason="Icarus Verilog not installed")
+def test_a_sized_class_constant_and_an_early_return():
+    src = ref("""    OP = B(0x63, 7)
+    q = Reg(8, reset=0)
+    @seq
+    def s(self):
+        if self.stall:
+            return
+        self.q.next = self.q + 1 if self.op == self.OP else self.q
+    @comb
+    def o(self):
+        self.y = self.q
+""", {"rst": 1, "stall": 1, "op": 7}, {"y": 8})
+    cycles = [{"rst": 1, "stall": 0, "op": 0}] + [{"rst": 0, "stall": i % 3 == 0, "op": 0x63 if i % 2 else 1} for i in range(40)]
+    same_as_run(src, cycles)
+
+
+@pytest.mark.skipif(not have_icarus, reason="Icarus Verilog not installed")
+def test_a_local_that_holds_a_state():
+    src = ref("""    st = State("S0", "S1", "S2")
+    @seq
+    def fsm(self):
+        nxt = self.st
+        if self.st == "S0":
+            if self.x:
+                nxt = "S1"
+        elif self.st == "S1":
+            nxt = "S2" if self.x else "S0"
+        else:
+            nxt = "S0"
+        if nxt == "S2" and self.hold:
+            nxt = self.st
+        self.st.next = nxt
+    @comb
+    def o(self):
+        self.at2 = self.st == "S2"
+""", {"rst": 1, "x": 1, "hold": 1}, {"at2": 1})
+    same_as_run(src, [{"rst": 1, "x": 0, "hold": 0}] + every({"x": 1, "hold": 1}, 60, {"rst": 0}))
+
+
+@pytest.mark.skipif(not have_icarus, reason="Icarus Verilog not installed")
+def test_a_register_named_like_a_verilog_keyword():
+    src = ref("""    buf = Reg(4, reset=0)
+    @seq
+    def s(self):
+        self.buf.next = self.d
+    @comb
+    def o(self):
+        self.q = self.buf
+""", {"rst": 1, "d": 4}, {"q": 4})
+    same_as_run(src, every({"d": 4}, 30, {"rst": 0}))

@@ -47,6 +47,43 @@ class E:
     width_sensitive: bool = False
 
 
+@dataclass
+class _StateE(E):
+    """A local that holds a state of a State register (`nxt = self.st`, then `nxt = "B"` on some path): its code, and the names it
+    is coded from (`prefix` names the localparams)."""
+
+    names: tuple[str, ...] = ()
+    prefix: str = ""
+
+    def code(self, name: str) -> E:
+        if name not in self.names:
+            raise Unsupported(f"state {name!r}")
+        return E(f"{self.prefix}__{name}", self.width)
+
+
+def _lift_returns(body: list[ast.stmt]) -> list[ast.stmt]:
+    """A block body whose `return` (no value) ends it early, rewritten without the return: the statements after an `if` that
+    returns on some path run in the paths that do not, as Python runs them."""
+    def returns(st: ast.stmt) -> bool:
+        return any(isinstance(n, ast.Return) for n in ast.walk(st))
+
+    out: list[ast.stmt] = []
+    for i, st in enumerate(body):
+        if isinstance(st, ast.Return):
+            if st.value is not None:
+                raise Unsupported("a block that returns a value")
+            return out
+        if isinstance(st, ast.If) and returns(st):
+            rest = body[i + 1:]
+            out.append(ast.If(test=st.test, body=_lift_returns(st.body + rest) or [ast.Pass()],
+                              orelse=_lift_returns(st.orelse + rest)))
+            return out
+        if returns(st):
+            raise Unsupported(f"a return inside {type(st).__name__}")
+        out.append(st)
+    return out
+
+
 def _const(value: int, width: int | None = None) -> E:
     w = width if width is not None else max(32, value.bit_length() + (1 if value < 0 else 0))
     return E(f"{w}'h{value & ((1 << w) - 1):x}", w)
@@ -256,6 +293,11 @@ class _Sym:
                 continue                                  # defined on one path only: reading it later is an error in Python too
             elif not isinstance(a, E) and not isinstance(b, E) and a == b:
                 merged[name] = a
+            elif isinstance(a, (_StateE, str)) and isinstance(b, (_StateE, str)):
+                # a state on each path (a state register's or a name): one coded value
+                like = a if isinstance(a, _StateE) else b if isinstance(b, _StateE) else self.state_like(a, b)
+                ea, eb = (v if isinstance(v, _StateE) else like.code(v) for v in (a, b))
+                merged[name] = _StateE(f"({c.text} ? {ea.text} : {eb.text})", like.width, names=like.names, prefix=like.prefix)
             elif _as_e(a) is not None and _as_e(b) is not None:
                 # an expression on one path and an expression or a constant on the other (a Python number that differs between the
                 # paths becomes a 32-bit unsized constant, as it is when it is used)
@@ -269,6 +311,14 @@ class _Sym:
             else:
                 raise Unsupported(f"local {name} is a Python value that differs between branches")
         self.locals = merged
+
+    def state_like(self, *names: str) -> _StateE:
+        """The coding of state names that two paths give a local: that of the State registers that have them all, when they agree."""
+        found = {tuple(v): k for k, v in self.ctx.states.items() if all(n in v for n in names)}
+        if len(found) != 1:
+            raise Unsupported(f"states {', '.join(map(repr, names))} of no one State register")
+        names_, reg = next(iter(found.items()))
+        return _StateE(reg, len(names_).bit_length(), names=names_, prefix=reg.upper())
 
     def match(self, st: ast.Match) -> None:
         subject = st.subject
@@ -343,6 +393,16 @@ class _Sym:
     # ── expressions ──
     def value_of(self, node: ast.expr) -> Any:
         """A local's value: a Python int/str/bool stays one (for indexes and loops), anything else is an expression."""
+        state = _state_ref(node)
+        if state is not None and state in self.ctx.states:
+            return _StateE(state, len(self.ctx.states[state]).bit_length(), names=tuple(self.ctx.states[state]), prefix=state.upper())
+        if isinstance(node, ast.IfExp) and self.static(node.test) is None:
+            a, b = self.value_of(node.body), self.value_of(node.orelse)
+            if isinstance(a, (_StateE, str)) and isinstance(b, (_StateE, str)):
+                # `"B" if cond else "A"`: a state chosen in this cycle
+                like = a if isinstance(a, _StateE) else b if isinstance(b, _StateE) else self.state_like(a, b)
+                ea, eb = (v if isinstance(v, _StateE) else like.code(v) for v in (a, b))
+                return _StateE(f"({self.cond(node.test).text} ? {ea.text} : {eb.text})", like.width, names=like.names, prefix=like.prefix)
         try:
             return self.py(node)
         except Unsupported:
@@ -404,8 +464,12 @@ class _Sym:
             decl = ctx.decls.get(name)
             if name in ctx.nets and self.mode in ("comb", "seq"):
                 return E(name, ctx.nets[name])
-            if name in self.assigned and isinstance(self.assigned[name], E):
-                return E(name, ctx.nets.get(name) or (decl.width if isinstance(decl, rk.Wire) else ctx.outputs[name]))
+            if name in self.assigned and isinstance(self.assigned[name], E) and not isinstance(self.assigned[name], _Partial):
+                # read after this block set it: the value it was just given (as RefKit runs it), not the net (a loop through itself)
+                e = self.assigned[name]
+                return E(_temp(e), e.width) if len(e.text) > 160 else e
+            if name in self.assigned:
+                raise Unsupported(f"self.{name} read after it was set on some paths only")
             if isinstance(decl, rk.Reg):
                 return E(name, decl.width)
             if isinstance(decl, rk.State):
@@ -416,6 +480,8 @@ class _Sym:
             v = getattr(ctx.cls, name, _MISSING)
             if isinstance(v, int) and not isinstance(v, bool):
                 return _const(v)
+            if isinstance(v, rk.Bits):
+                return _const(int(v), v.w)                 # a class constant written B(value, width)
             raise Unsupported(f"self.{name}")
         if isinstance(node, ast.BinOp):
             try:
@@ -426,9 +492,13 @@ class _Sym:
                 pass
             a, b = self.expr(node.left), self.expr(node.right)
             if isinstance(node.op, (ast.LShift, ast.RShift)):
-                n = self.int_of(node.right)
+                # the result has the left operand's width; the amount is self-determined (a constant, or a value of this cycle)
                 op = "<<" if isinstance(node.op, ast.LShift) else ">>"
-                return E(f"({a.text} {op} {n})", a.width, False, a.width_sensitive or op == ">>")
+                try:
+                    amount = str(self.int_of(node.right))
+                except Unsupported:
+                    amount = _sized(b)
+                return E(f"({a.text} {op} {amount})", a.width, False, a.width_sensitive or op == ">>")
             ops = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.FloorDiv: "/", ast.Div: "/", ast.Mod: "%",
                    ast.BitAnd: "&", ast.BitOr: "|", ast.BitXor: "^", ast.Pow: "**"}
             op = ops.get(type(node.op))
@@ -475,6 +545,11 @@ class _Sym:
             parts = [self.compare(left, ast.Eq(), e) for e in right.elts]
             any_of = E("(" + " || ".join(p.text for p in parts) + ")", 1, True)
             return any_of if isinstance(op, ast.In) else _not(any_of)
+        # a local holding a state compared with a name
+        held = self.locals.get(left.id) if isinstance(left, ast.Name) else None
+        if isinstance(held, _StateE) and isinstance(op, (ast.Eq, ast.NotEq)):
+            code = held.code(self.py(right))
+            return E(f"({held.text} {'==' if isinstance(op, ast.Eq) else '!='} {code.text})", 1, True)
         # a state register compared with a name
         state = _state_ref(left)
         if state is not None and state in self.ctx.states:
@@ -573,8 +648,15 @@ class _Sym:
                     return E(f"{v.width}'({{{_sized(v)}, {_sized(new)}}})", v.width)
                 return E(f"{v.width}'({{{_sized(new)}, {_sized(v)}}} >> {new.width})", v.width)
             if method == "set_bit":
-                i = self.int_of(args[0])
-                return _splice(v, i, i, _fit(self.expr(args[1]), 1), v.width)
+                bit_value = _fit(self.expr(args[1]), 1)
+                try:
+                    i = self.int_of(args[0])
+                except Unsupported:
+                    # an index of this cycle: clear that bit, then put the new one in its place
+                    at = _sized(self.expr(args[0]))
+                    w = v.width
+                    return E(f"(({w}'({v.text}) & ~({w}'d1 << {at})) | ({w}'({bit_value.text}) << {at}))", w)
+                return _splice(v, i, i, bit_value, v.width)
             if method == "set_slice":
                 hi, lo = self.int_of(args[0]), self.int_of(args[1])
                 return _splice(v, hi, lo, _fit(self.expr(args[2]), hi - lo + 1), v.width)
@@ -630,6 +712,11 @@ class _Sym:
         source = _state_ref(node)
         if source is not None and source in self.ctx.states and self.ctx.states[source] == self.ctx.states[reg]:
             return E(source, len(self.ctx.states[reg]).bit_length())
+        held = self.locals.get(node.id) if isinstance(node, ast.Name) else None
+        if isinstance(held, _StateE):
+            if list(held.names) != self.ctx.states[reg]:
+                raise Unsupported(f"a state of another State register assigned to {reg}")
+            return E(held.text, len(self.ctx.states[reg]).bit_length())
         name = self.py(node)
         if name not in self.ctx.states[reg]:
             raise Unsupported(f"state {name!r}")
@@ -817,6 +904,8 @@ def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "c
     if cls not in _SOURCES:
         raise Unsupported("the module class was not found in the source")
     inputs, outputs = dict(meta["inputs"]), dict(meta["widths"])
+    if not meta["combinational"]:
+        inputs.pop(clock_name, None)                # the clock listed among the inputs: it is the clock port
     # a Reg() declared without a width has the width of its output port, or 32 bits (as RefKit runs it)
     decls = {n: (rk.Reg(outputs.get(n, rk.NUMBER_WIDTH), d.reset, d.init) if isinstance(d, rk.Reg) and d.width is None else d)
              for n, d in cls._decls.items()}
@@ -853,7 +942,7 @@ def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "c
     set_nets: dict[str, E] = {}
     for block in cls._comb:
         sym = _Sym(ctx, "comb")
-        sym.run(_function_ast(cls, block.__name__).body)
+        sym.run(_lift_returns(_function_ast(cls, block.__name__).body))
         for name, e in sym.assigned.items():
             width = ctx.outputs.get(name) or ctx.decls[name].width
             if sym.bits_set.get(name, 0) != (1 << width) - 1:
@@ -878,7 +967,7 @@ def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "c
     if cls._seq:
         sym = _Sym(ctx, "seq")
         for block in cls._seq:
-            sym.run(_function_ast(cls, block.__name__).body)
+            sym.run(_lift_returns(_function_ast(cls, block.__name__).body))
         reset = meta["reset"]
         active = int(meta["active"])
         level = f"({_vname(reset)} == 1'b{active})" if reset is not None else None
@@ -928,11 +1017,87 @@ def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "c
             lines.append("  end")
     lines.append("endmodule")
     out = lines[:declarations_end] + [d for d, _ in _TEMPS] + lines[declarations_end:-1] + [a for _, a in _TEMPS] + lines[-1:]
-    return Translation("\n".join(out) + "\n", module_name, ctx.notes, edge_kw)
+    verilog = _rename_keywords("\n".join(out) + "\n", list(decls), set(inputs) | set(outputs))
+    return Translation(verilog, module_name, ctx.notes, edge_kw)
 
 
 def _rng(width: int) -> str:
     return f"[{width - 1}:0] " if width > 1 else ""
+
+
+# Verilog and SystemVerilog keywords a reference may well use as the name of a register, wire or memory (`buf`, `int`, `bit`);
+# the translation renames them. The keywords the translation itself writes (begin, end, if, or, ...) are refused instead.
+_RENAMED_KEYWORDS = {
+    "buf", "and", "nand", "nor", "xor", "xnor", "not", "bufif0", "bufif1", "notif0", "notif1", "pullup", "pulldown", "tran",
+    "cmos", "nmos", "pmos", "time", "real", "realtime", "event", "task", "function", "case", "casex", "casez", "default", "endcase",
+    "signed", "unsigned", "logic", "bit", "byte", "int", "shortint", "longint", "string", "class", "type", "struct", "union", "enum",
+    "packed", "const", "static", "automatic", "parameter", "specify", "table", "primitive", "supply0", "supply1", "tri", "wand", "wor",
+    "repeat", "while", "forever", "fork", "join", "wait", "disable", "force", "release", "deassign", "genvar", "generate", "small",
+    "medium", "large", "strong0", "strong1", "weak0", "weak1", "highz0", "highz1", "scalared", "vectored", "edge", "cell", "config",
+    "design", "library", "instance", "use", "do", "break", "continue", "return", "void", "final", "assert", "property", "sequence",
+    "cover", "bind", "import", "export", "package", "interface", "program", "modport", "clocking", "chandle", "shortreal", "var",
+    "unique", "priority", "inside", "dist", "with", "rand", "randc", "constraint", "extends", "virtual", "this", "super", "new",
+    "local", "protected", "pure", "context", "alias", "ref", "null", "matches", "tagged", "first_match", "throughout", "within",
+    "intersect", "wildcard", "solve", "before", "after", "global", "let", "checker", "restrict", "until", "implies", "nexttime",
+}
+_WRITTEN_KEYWORDS = {"module", "endmodule", "input", "output", "reg", "wire", "assign", "always", "posedge", "negedge", "or",
+                     "begin", "end", "if", "else", "for", "integer", "initial", "localparam"}
+
+
+def _rename_keywords(verilog: str, names: list[str], ports: set[str]) -> str:
+    """The translation with every internal name that is a keyword renamed (`buf` -> `buf__k`)."""
+    for name in names:
+        if name in _WRITTEN_KEYWORDS or (name in ports and (name in _RENAMED_KEYWORDS)):
+            raise Unsupported(f"a register, wire or port named {name}, a Verilog keyword")
+        if name in _RENAMED_KEYWORDS and name not in ports:
+            verilog = re.sub(rf"(?<![\w$']){re.escape(name)}(?![\w$])", f"{name}__k", verilog)
+    return verilog
+
+
+def cosimulate(source: str, cycles: list[dict[str, int]], *, timeout: int = 120) -> list[dict[str, int | None]]:
+    """The translation of a completed reference simulated with Icarus Verilog over `cycles`, read as RefKit runs a reference: the
+    inputs of a cycle applied, the outputs read before the rising edge that ends it. To check a translation against `run`; an
+    output Icarus shows unknown (x or z) in a cycle is None there."""
+    ns: dict[str, Any] = {}
+    exec(compile(source, "<reference>", "exec"), ns)  # noqa: S102
+    meta = ns["__refkit__"]
+    outputs = dict(meta["widths"])
+    clocked = not meta["combinational"]
+    clk = next(c for c in ("clk", "refkit_clk", "refkit_clk_") if c not in outputs)   # an output may be called clk
+    t = translate(source, "dut", clk)
+    inputs = {n: w for n, w in meta["inputs"].items() if not (clocked and n == clk)}
+    iverilog, vvp = _tool("iverilog"), _tool("vvp")
+    if iverilog is None or vvp is None:
+        raise Unsupported("Icarus Verilog (iverilog, vvp) not found")
+    tb = ["module tb;", f"  reg {clk} = 0;"] + [f"  reg {_rng(w)}{n} = 0;" for n, w in inputs.items()] + \
+        [f"  wire {_rng(w)}{n};" for n, w in outputs.items()]
+    pins = ([f".{clk}({clk})"] if clocked else []) + [f".{n}({n})" for n in [*inputs, *outputs]]
+    tb.append(f"  dut u ({', '.join(pins)});")
+    tb.append("  initial begin")
+    for x in cycles:
+        tb += [f"    {n} = {w}'h{rk.mask(int(x.get(n, 0)), w):x};" for n, w in inputs.items()]
+        tb.append("    #5;")
+        fmt = " ".join(f"{n}=%h" for n in outputs)
+        tb.append(f'    $display("{fmt}", {", ".join(outputs)});' if outputs else '    $display("");')
+        tb.append(f"    {clk} = 1; #5; {clk} = 0;" if clocked else "    #5;")
+    tb += ["    $finish;", "  end", "endmodule"]
+    with tempfile.TemporaryDirectory() as d:
+        Path(d, "dut.v").write_text(t.verilog)
+        Path(d, "tb.v").write_text("\n".join(tb) + "\n")
+        build = subprocess.run([iverilog, "-g2012", "-o", f"{d}/sim", f"{d}/dut.v", f"{d}/tb.v"], capture_output=True, text=True, timeout=timeout)
+        if build.returncode != 0:
+            raise Unsupported(f"iverilog: {build.stderr.strip()[:300]}")
+        sim = subprocess.run([vvp, "-n", f"{d}/sim"], capture_output=True, text=True, timeout=timeout)
+    rows: list[dict[str, int | None]] = []
+    for line in sim.stdout.splitlines():
+        if "=" not in line and outputs:
+            continue
+        row: dict[str, int | None] = {}
+        for part in line.split():
+            name, _, value = part.partition("=")
+            row[name] = None if re.search(r"[xzXZ]", value) else int(value, 16)
+        rows.append(row)
+    return rows[:len(cycles)]
 
 
 # ─── the proof ──────────────────────────────────────────────────────────────────────────────────────────────────────────
