@@ -480,11 +480,19 @@ def _origin(followed: "Trace | None", cycle: int, name: str, inner: set[str]) ->
     if followed is None:
         return ""
     c = followed.cycles[cycle]
+
+    def then(ran: int) -> str:
+        """The registers in the cycle a line ran: the values it computed from."""
+        if not 0 <= ran < len(followed.cycles):
+            return ""
+        shown = " ".join(f"{k}={v if not isinstance(v, int) or v < 16 else hex(v)}" for k, v in followed.cycles[ran].registers.items())
+        return f" (registers then: {shown})" if shown else ""
+
     if name in inner:
         line = followed.cycles[cycle - 1].written.get(name) if cycle > 0 else None
         if cycle > 0 and followed.cycles[cycle - 1].reset or line is None and cycle > 0 and c.reset:
             return "; the reset gave it"
-        return "" if not isinstance(line, int) else f"; {name} is a register: line {line} `{followed.line(line)}` wrote it in cycle {cycle - 1}"
+        return "" if not isinstance(line, int) else f"; {name} is a register: line {line} `{followed.line(line)}` wrote it in cycle {cycle - 1}{then(cycle - 1)}"
     origin = c.set_by.get(name)
     if origin == RESET:
         return "; the reset gave it"
@@ -492,8 +500,8 @@ def _origin(followed: "Trace | None", cycle: int, name: str, inner: set[str]) ->
         return ""
     text = f"line {origin} `{followed.line(origin)}`"
     if name in c.written_in:
-        return f"; {name} is a register: {text} wrote it in cycle {c.written_in[name]}"
-    return f"; {text} set it in this cycle (@comb)"
+        return f"; {name} is a register: {text} wrote it in cycle {c.written_in[name]}{then(c.written_in[name])}"
+    return f"; {text} set it in this cycle (@comb){then(cycle)}"
 
 
 def _check_moore(m: Machine, cycles: Sequence[Mapping[str, int]], spec: ResetSpec | None, widths: Mapping[str, int] | None) -> None:

@@ -153,7 +153,7 @@ def test_an_example_can_give_an_inner_register_and_its_mismatch_names_the_line()
     with pytest.raises(ExampleMismatch) as e:
         run(cls, cycles, reset="rst", widths={"serial_out": 1})
     assert "example 1, cycle 9: the description gives tmp = 2, the machine gives 129" in str(e.value)
-    assert "tmp is a register: line 16 `self.tmp.next = self.tmp + 1` wrote it in cycle 8" in str(e.value)
+    assert "tmp is a register: line 16 `self.tmp.next = self.tmp + 1` wrote it in cycle 8 (registers then: tmp=0x80 cnt=7)" in str(e.value)
 
 
 def test_an_example_output_mismatch_names_the_comb_line_and_unknown_names_are_errors():
