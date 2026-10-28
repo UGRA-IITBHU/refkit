@@ -4,7 +4,7 @@ import inspect
 
 import pytest
 
-from refkit import RESET, Module, Reg, RefKitError, State, comb, seq, trace
+from refkit import RESET, ExampleMismatch, Module, Reg, RefKitError, State, comb, load, run, seq, trace
 
 
 class Late(Module):
@@ -125,3 +125,43 @@ def test_inner_registers_named_are_explained_too():
     text = t.explain(registers=["tmp"])
     assert f"cycle 2: tmp 1 -> 2. tmp is a register: line {shift} `self.tmp.next = self.tmp.shift_in_low(0)` wrote it in cycle 1." in text
     assert ": tmp " not in t.explain()
+
+
+SHIFTY = """from refkit import *
+
+class Shifty(Module):
+    tmp = Reg(8, reset=1)
+    cnt = Reg(3)
+
+    @comb
+    def out(self):
+        self.serial_out = self.tmp[7]
+
+    @seq
+    def step(self):
+        self.tmp.next = self.tmp.shift_in_low(0)
+        self.cnt.next = self.cnt + 1
+        if self.cnt == 7:
+            self.tmp.next = self.tmp + 1
+"""
+
+
+def test_an_example_can_give_an_inner_register_and_its_mismatch_names_the_line():
+    ns = load(SHIFTY)
+    cycles = [{"rst": 1}] + [{"rst": 0}] * 10
+    cls = type("WithExample", (ns["Shifty"],), {"examples": [(cycles, [{}] * 9 + [{"tmp": 2}])]})
+    with pytest.raises(ExampleMismatch) as e:
+        run(cls, cycles, reset="rst", widths={"serial_out": 1})
+    assert "example 1, cycle 9: the description gives tmp = 2, the machine gives 129" in str(e.value)
+    assert "tmp is a register: line 16 `self.tmp.next = self.tmp + 1` wrote it in cycle 8" in str(e.value)
+
+
+def test_an_example_output_mismatch_names_the_comb_line_and_unknown_names_are_errors():
+    ns = load(SHIFTY)
+    cycles = [{"rst": 1}] + [{"rst": 0}] * 3
+    cls = type("Out", (ns["Shifty"],), {"examples": [(cycles, [{}, {"serial_out": 1}])]})
+    with pytest.raises(ExampleMismatch, match="line 9 `self.serial_out = self.tmp\\[7\\]` set it in this cycle"):
+        run(cls, cycles, reset="rst", widths={"serial_out": 1})
+    bad = type("Bad", (ns["Shifty"],), {"examples": [(cycles, [{"nothing": 1}])]})
+    with pytest.raises(RefKitError, match="neither outputs nor registers"):
+        run(bad, cycles, reset="rst", widths={"serial_out": 1})

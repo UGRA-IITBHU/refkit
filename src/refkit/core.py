@@ -445,15 +445,55 @@ def run(
 
 
 def _check_examples(m: Machine, spec: ResetSpec | None, widths: Mapping[str, int] | None) -> None:
+    """Each example reproduced. An example may also give an inner register's (or a State's) value in a cycle, as the register holds
+    it during that cycle; a Module's mismatch names the line of the module that gave the value."""
+    kwargs: dict[str, Any] = dict(inputs=getattr(m, "_in_widths", None), reset=spec.port if spec else None,
+                                  active=spec.active if spec else 1, style=spec.style if spec else "sync", widths=widths)
     for number, (inputs, expected) in enumerate(m.examples, start=1):
-        got = run(m, inputs, inputs=getattr(m, "_in_widths", None), reset=spec.port if spec else None, active=spec.active if spec else 1,
-                  style=spec.style if spec else "sync", widths=widths, _examples=False)
+        names = {n for want in expected for n, v in want.items() if v is not None}
+        inner = {n for n in names if n in m.regs and (widths is None or n not in widths)}
+        unknown = sorted(n for n in names - inner if widths is not None and n not in widths)
+        if unknown:
+            raise RefKitError(f"example {number} gives {unknown}, which are neither outputs nor registers of the module "
+                              f"(outputs: {sorted(widths or ())}; registers: {sorted(m.regs)})")
+        followed = None
+        if isinstance(m, Module) and not m.needs_steps:
+            followed = trace(m, inputs, **{k: v for k, v in kwargs.items() if k != "inputs"}, inputs=kwargs["inputs"])
+            got = [c.outputs for c in followed.cycles]
+        elif inner:
+            raise RefKitError(f"example {number} gives the registers {sorted(inner)}: only a Module run cycle by cycle can be followed")
+        else:
+            got = run(m, inputs, **kwargs, _examples=False)
         for cycle, (want, have) in enumerate(zip(expected, got)):
             for name, value in want.items():
-                if value is not None and have.get(name) != value:
+                if value is None:
+                    continue
+                now = followed.cycles[cycle].registers.get(name) if name in inner else have.get(name)
+                if now != value:
                     raise ExampleMismatch(
                         f"example {number}, cycle {cycle}: the description gives {name} = {value}, the machine gives "
-                        f"{have.get(name)} (inputs of that cycle: {dict(inputs[cycle])})")
+                        f"{now} (inputs of that cycle: {dict(inputs[cycle])})" + _origin(followed, cycle, name, inner))
+
+
+def _origin(followed: "Trace | None", cycle: int, name: str, inner: set[str]) -> str:
+    """Where a value an example disputes came from, as `Trace.explain` says it: the line behind it, and the cycle it ran in."""
+    if followed is None:
+        return ""
+    c = followed.cycles[cycle]
+    if name in inner:
+        line = followed.cycles[cycle - 1].written.get(name) if cycle > 0 else None
+        if cycle > 0 and followed.cycles[cycle - 1].reset or line is None and cycle > 0 and c.reset:
+            return "; the reset gave it"
+        return "" if not isinstance(line, int) else f"; {name} is a register: line {line} `{followed.line(line)}` wrote it in cycle {cycle - 1}"
+    origin = c.set_by.get(name)
+    if origin == RESET:
+        return "; the reset gave it"
+    if not isinstance(origin, int):
+        return ""
+    text = f"line {origin} `{followed.line(origin)}`"
+    if name in c.written_in:
+        return f"; {name} is a register: {text} wrote it in cycle {c.written_in[name]}"
+    return f"; {text} set it in this cycle (@comb)"
 
 
 def _check_moore(m: Machine, cycles: Sequence[Mapping[str, int]], spec: ResetSpec | None, widths: Mapping[str, int] | None) -> None:
@@ -1684,15 +1724,13 @@ def trace(
         if asserted:
             last.update({n: (RESET, i) for n in resettable})
         s = nxt
-    import inspect
-    try:
-        file = inspect.getsourcefile(type(m))
-    except (TypeError, OSError):
-        file = None
+    # The lines a trace names are lines of the module's blocks: the file they were compiled from (a subclass may live elsewhere).
+    blocks = [*m._comb, *m._seq]
+    file = blocks[0].__code__.co_filename if blocks else None
     return Trace(rows, [n for n, d in m.regs.items() if isinstance(d, State)], file)
 
 
-__all__ += ["trace", "Trace", "TraceCycle", "RESET"]
+__all__ += ["trace", "Trace", "TraceCycle", "RESET", "load"]
 
 
 # ─── exact comparison of two completed references (harness `reference-stability`) ─────────────────────────────────────
@@ -1743,10 +1781,21 @@ __all__ += ["compare_sources"]
 
 # ─── stimulus that visits every transition of a RefKit reference ────────────────────────────────────────────────────────
 
+def load(source: str, namespace: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run a reference's source and return its namespace. It is compiled under a name of its own (`<reference-…>`) whose text is
+    registered with linecache, so a traceback, `trace` and an example's mismatch can quote its lines."""
+    import hashlib
+    import linecache
+    name = f"<reference-{hashlib.sha1(source.encode()).hexdigest()[:12]}>"
+    linecache.cache[name] = (len(source), None, source.splitlines(True), name)
+    ns: dict[str, Any] = {} if namespace is None else namespace
+    exec(compile(source, name, "exec"), ns)  # noqa: S102
+    return ns
+
+
 def _meta_of(source: str) -> dict[str, Any] | None:
-    ns: dict[str, Any] = {}
     try:
-        exec(compile(source, "<reference>", "exec"), ns)  # noqa: S102
+        ns = load(source)
     except Exception:  # noqa: BLE001
         return None
     meta = ns.get("__refkit__")
