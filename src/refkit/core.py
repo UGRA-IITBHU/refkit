@@ -1582,9 +1582,12 @@ class Trace:
         import linecache
         return linecache.getline(self.file, number).strip()
 
-    def explain(self, source: str | None = None, *, outputs: Sequence[str] | None = None, limit: int = 40) -> str:
+    def explain(self, source: str | None = None, *, outputs: Sequence[str] | None = None, registers: Sequence[str] = (),
+                limit: int = 40) -> str:
         """The run as a model reads it: a table of the cycles, then, for each change of an output, the line of the module that made
-        it and, for a register, the cycle in which that line ran and the states then. `outputs` limits the changes explained."""
+        it and, for a register, the cycle in which that line ran and the states then. `outputs` limits the outputs whose changes are
+        explained; `registers` names inner registers whose changes are explained too (a value a description speaks of that is not
+        an output: what `.next` gave it, in which cycle)."""
         def show(v: Any) -> str:
             return "-" if v is None else str(v) if not isinstance(v, int) or v < 16 else f"0x{v:x}"
 
@@ -1613,6 +1616,17 @@ class Trace:
                                    "cycle from the next cycle on.")
                 elif isinstance(origin, int):
                     changes.append(f"{head} Set in this same cycle by line {origin} `{self.line(origin, source)}` (@comb).")
+            for name in registers:
+                if name in c.outputs or name not in c.registers or c.registers[name] == previous.registers.get(name):
+                    continue
+                head = f"cycle {c.cycle}: {name} {show(previous.registers.get(name))} -> {show(c.registers[name])}."
+                line = previous.written.get(name)
+                if previous.reset or (c.reset and line is None):
+                    changes.append(f"{head} The reset gave it.")
+                elif isinstance(line, int):
+                    states = row({k: v for k, v in previous.registers.items() if k in self.states})
+                    changes.append(f"{head} {name} is a register: line {line} `{self.line(line, source)}` wrote it in cycle {previous.cycle}"
+                                   + (f" (then {states})" if states != "-" else "") + ".")
         if changes:
             out.append("")
             out.append("Where each change of an output came from:")

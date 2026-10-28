@@ -101,3 +101,27 @@ def test_outputs_limit_the_changes_explained_and_step_modules_are_refused():
 
     with pytest.raises(RefKitError, match="cycle by cycle"):
         trace(Neg, [{}], widths={"q": 1})
+
+
+def test_inner_registers_named_are_explained_too():
+    class Shifty(Module):
+        tmp = Reg(8, reset=1)
+        cnt = Reg(3)
+
+        @comb
+        def out(self):
+            self.serial_out = self.tmp[7]
+
+        @seq
+        def step(self):
+            self.tmp.next = self.tmp.shift_in_low(0)
+            self.cnt.next = self.cnt + 1
+            if self.cnt == 7:
+                self.tmp.next = self.tmp + 1
+
+    t = trace(Shifty, [{"rst": 1}] + [{"rst": 0}] * 10, reset="rst", widths={"serial_out": 1})
+    lines = [l.strip() for l in inspect.getsourcelines(Shifty)[0]]
+    shift = inspect.getsourcelines(Shifty)[1] + lines.index("self.tmp.next = self.tmp.shift_in_low(0)")
+    text = t.explain(registers=["tmp"])
+    assert f"cycle 2: tmp 1 -> 2. tmp is a register: line {shift} `self.tmp.next = self.tmp.shift_in_low(0)` wrote it in cycle 1." in text
+    assert ": tmp " not in t.explain()
