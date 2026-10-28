@@ -343,12 +343,16 @@ def _asserted(spec: ResetSpec | None, x: Mapping[str, int]) -> bool:
 
 def _step(
     m: Machine, s: dict[str, Any], x: Mapping[str, int], reset: ResetSpec | None, widths: Mapping[str, int] | None,
+    seen: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, int | None]]:
-    """One clock cycle: the outputs of this cycle (sampled before the edge) and the registers after the edge."""
+    """One clock cycle: the outputs of this cycle (sampled before the edge) and the registers after the edge. `seen`, when given,
+    receives the registers as this cycle's blocks read them (an asynchronous reset already acted)."""
     m._out_widths = widths  # type: ignore[attr-defined]  # a Module needs them to give its outputs their widths
     init = m.reset_values()
     if reset is not None and reset.style == "async" and _asserted(reset, x):
         s = _after_reset(m, s)                           # an asynchronous reset shows in this very cycle
+    if seen is not None:
+        seen.append(dict(s))
     sv, xv = _View(s), _View(x)
     out = m._engine_outputs(sv, xv)
     if not isinstance(out, Mapping):
@@ -1207,6 +1211,7 @@ class _Frame:
         d(self, "_partial", {})         # outputs and wires with only some bits set: name -> (value, bits not yet set)
         d(self, "_reads", set())        # inputs read by @seq blocks (the reset check needs to know)
         d(self, "_origins", {})         # register -> the line of the model's code that last assigned its .next
+        d(self, "_net_origins", {})     # output or wire -> the line of the model's code that last set it in @comb
 
     def __getattr__(self, name: str) -> Any:
         m = object.__getattribute__(self, "_module")
@@ -1275,6 +1280,7 @@ class _Frame:
         nets = object.__getattribute__(self, "_nets")
         nets[name] = None if value is None else Bits(value, width)
         object.__getattribute__(self, "_partial").pop(name, None)
+        object.__getattribute__(self, "_net_origins")[name] = _caller_line()
 
     def _net_width(self, name: str) -> int | None:
         """The width of an output port or a wire called `name`, or None when it is neither."""
@@ -1316,6 +1322,7 @@ class _Frame:
             current, unset = partial.get(name, (0, (1 << width) - 1))
         new = int(Bits(current, width).set_slice(high, low, value))
         unset &= ~(((1 << (high - low + 1)) - 1) << low)
+        object.__getattribute__(self, "_net_origins")[name] = _caller_line()
         if unset:
             partial[name] = (new, unset)
         else:
@@ -1415,6 +1422,7 @@ class Module(Machine):
         frame = self._comb_frame(s, x, "comb")
         nets = object.__getattribute__(frame, "_nets")
         partial = object.__getattribute__(frame, "_partial")
+        self._net_origins = dict(object.__getattribute__(frame, "_net_origins"))  # type: ignore[attr-defined]  # for trace()
         out: dict[str, int | None] = {}
         for name in (getattr(self, "_out_widths", None) or {n: d.width for n, d in self._decls.items() if isinstance(d, Output)}):
             if name in partial:
@@ -1528,6 +1536,149 @@ def run_stepped(
 
 
 __all__ += ["Value", "Bits", "B", "cat", "mux", "clog2", "Wire", "Mem", "Input", "Output", "Instance", "seq", "comb", "latch", "casez", "Module", "run_stepped"]
+
+
+# ─── following a run: where each output's value came from ───────────────────────────────────────────────────────────────
+
+#: An output or register given its value by the reset rather than by a line of the module.
+RESET = "reset"
+
+
+@dataclass
+class TraceCycle:
+    """One clock cycle of a traced run. `registers` are the registers and states as this cycle's blocks read them (memories and
+    instances left out); `outputs` are read before the edge that ends the cycle. `set_by` gives, for each output, the line of the
+    module that gave it this cycle's value: for a @comb output the line that set it in this cycle, for a register output the line
+    whose `.next` wrote it in an earlier cycle (RESET when the reset gave it, None for its power-up value). `written` gives, for
+    each register assigned in this cycle, the line whose `.next` takes effect at the edge that ends it."""
+
+    cycle: int
+    inputs: dict[str, int]
+    registers: dict[str, Any]
+    outputs: dict[str, int | None]
+    set_by: dict[str, int | str | None]
+    written: dict[str, int | None]
+    reset: bool = False
+    written_in: dict[str, int] = field(default_factory=dict)   # register output -> the cycle in which `set_by` ran
+
+
+@dataclass
+class Trace:
+    """A traced run (`trace`): one TraceCycle per cycle, and the file the module was written in, when it has one."""
+
+    cycles: list[TraceCycle]
+    states: list[str]
+    file: str | None = None
+
+    def line(self, number: int | None, source: str | None = None) -> str:
+        """The text of a line of the module, from `source` when given (a module compiled from a string), else from its file."""
+        if not isinstance(number, int):
+            return ""
+        if source is not None:
+            lines = source.splitlines()
+            return lines[number - 1].strip() if 0 < number <= len(lines) else ""
+        if self.file is None:
+            return ""
+        import linecache
+        return linecache.getline(self.file, number).strip()
+
+    def explain(self, source: str | None = None, *, outputs: Sequence[str] | None = None, limit: int = 40) -> str:
+        """The run as a model reads it: a table of the cycles, then, for each change of an output, the line of the module that made
+        it and, for a register, the cycle in which that line ran and the states then. `outputs` limits the changes explained."""
+        def show(v: Any) -> str:
+            return "-" if v is None else str(v) if not isinstance(v, int) or v < 16 else f"0x{v:x}"
+
+        def row(values: Mapping[str, Any]) -> str:
+            return " ".join(f"{k}={show(v)}" for k, v in values.items()) or "-"
+
+        out = ["cycle | inputs | registers during the cycle | outputs (read before the clock edge that ends the cycle)"]
+        for c in self.cycles:
+            inner = {k: v for k, v in c.registers.items() if k not in c.outputs}     # a register output shows once, as an output
+            out.append(f"{c.cycle} | {row(c.inputs)} | {row(inner)} | {row(c.outputs)}" + (" (reset asserted)" if c.reset else ""))
+        changes: list[str] = []
+        for previous, c in zip(self.cycles, self.cycles[1:]):
+            for name, value in c.outputs.items():
+                if (outputs is not None and name not in outputs) or value == previous.outputs.get(name):
+                    continue
+                head = f"cycle {c.cycle}: {name} {show(previous.outputs.get(name))} -> {show(value)}."
+                origin = c.set_by.get(name)
+                if origin == RESET:
+                    changes.append(f"{head} The reset gave it.")
+                elif name in c.written_in and isinstance(origin, int):
+                    ran = c.written_in[name]
+                    when = self.cycles[ran] if 0 <= ran < len(self.cycles) else None
+                    states = row({k: v for k, v in when.registers.items() if k in self.states}) if when is not None else "-"
+                    changes.append(f"{head} {name} is a register: line {origin} `{self.line(origin, source)}` wrote it in cycle {ran}"
+                                   + (f" (then {states})" if states != "-" else "") + ", and a register shows what is written in a "
+                                   "cycle from the next cycle on.")
+                elif isinstance(origin, int):
+                    changes.append(f"{head} Set in this same cycle by line {origin} `{self.line(origin, source)}` (@comb).")
+        if changes:
+            out.append("")
+            out.append("Where each change of an output came from:")
+            out.extend(changes[:limit])
+            if len(changes) > limit:
+                out.append(f"... and {len(changes) - limit} more changes")
+        return "\n".join(out)
+
+
+def trace(
+    machine: type[Module] | Module, cycles: Sequence[Mapping[str, int]], *, reset: str | None = None, active: int = 1,
+    style: str = "sync", widths: Mapping[str, int] | None = None, inputs: Mapping[str, int] | None = None, memory: Any = None,
+) -> Trace:
+    """Run a Module as `run` does and follow it: the registers in each cycle, and which line of the module gave each output and
+    each register its value. A model checks a run it can read cycle by cycle, with the line behind every change, far better than
+    it simulates its own code in its head (a register written in a state shows in the cycle AFTER the state is entered)."""
+    m = _resolve(machine)
+    if not isinstance(m, Module):
+        raise RefKitError("trace follows a Module")
+    if m.needs_steps:
+        raise RefKitError("trace follows a Module run cycle by cycle (no negedge or dual-edge @seq block, no @latch)")
+    m._out_widths = widths  # type: ignore[attr-defined]
+    if inputs is not None:
+        m._in_widths = dict(inputs)  # type: ignore[attr-defined]
+    if memory is not None:
+        m._memory = memory  # type: ignore[attr-defined]
+    spec = ResetSpec(reset, active, style) if reset is not None else None
+    resettable = {n for n, d in m.regs.items() if not isinstance(d, Reg) or d.reset is not None}
+    s = m.reset_values()
+    last: dict[str, tuple[int | str | None, int]] = {}      # register -> (the line that gave it its value, the cycle it ran in)
+    rows: list[TraceCycle] = []
+    for i, x in enumerate(cycles):
+        asserted = _asserted(spec, x)
+        if asserted and spec is not None and spec.style == "async":
+            last.update({n: (RESET, i) for n in resettable})
+        seen: list[dict[str, Any]] = []
+        nxt, o = _step(m, s, x, spec, widths, seen)
+        nets = dict(getattr(m, "_net_origins", {}))
+        written = dict(getattr(m, "_seq_origins", {}))
+        set_by: dict[str, int | str | None] = {}
+        written_in: dict[str, int] = {}
+        for name in o:
+            if name in nets:
+                set_by[name] = nets[name]
+            elif name in m.regs:
+                origin, ran = last.get(name, (None, -1))
+                set_by[name] = origin
+                if isinstance(origin, int):
+                    written_in[name] = ran
+        registers = {n: v for n, v in seen[0].items() if n in m.regs}
+        rows.append(TraceCycle(i, {k: int(v) for k, v in x.items()}, registers, o, set_by, written, asserted, written_in))
+        for name, line in written.items():
+            if name in m.regs and nxt.get(name) != seen[0].get(name) or name not in last:
+                last[name] = (line, i)
+        if asserted:
+            last.update({n: (RESET, i) for n in resettable})
+        s = nxt
+    import inspect
+    try:
+        file = inspect.getsourcefile(type(m))
+    except (TypeError, OSError):
+        file = None
+    return Trace(rows, [n for n, d in m.regs.items() if isinstance(d, State)], file)
+
+
+__all__ += ["trace", "Trace", "TraceCycle", "RESET"]
 
 
 # ─── exact comparison of two completed references (harness `reference-stability`) ─────────────────────────────────────
