@@ -432,3 +432,8 @@ failed only because of x, and 9 had references the translator refused.
   (clock_divider_0003, apb_history_shift_register_0001) is lifted as one inside an `if` was: the statements after the `match`
   run in every case that did not return, and in the case of no match when there is no `case _`. 12 more stored references
   translate, all agree with RefKit's run. Test.
+- **T9. `cosimulate` missed an asynchronous reset asserted from the first cycle. fixed (test bench only).** Its test bench
+  declared every input `= 0`, so an active-low asynchronous reset held from time 0 never had an edge and the registers kept their
+  power-up values (`init`) until the first clock, while RefKit's run resets in cycle 0 (piso_0001 and factorial_0001
+  references showed as differing in cycle 0). The inputs now start unknown and take their first values at time 0 (an edge).
+  The translation itself is unchanged; a real test bench that drives the reset from x/z or toggles it sees the same edge.

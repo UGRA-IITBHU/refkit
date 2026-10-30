@@ -1355,7 +1355,9 @@ def cosimulate(source: str, cycles: list[dict[str, int]], *, timeout: int = 120)
     iverilog, vvp = _tool("iverilog"), _tool("vvp")
     if iverilog is None or vvp is None:
         raise Unsupported("Icarus Verilog (iverilog, vvp) not found")
-    tb = ["module tb;", f"  reg {clk} = 0;"] + [f"  reg {_rng(w)}{n} = 0;" for n, w in inputs.items()] + \
+    # the inputs start unknown and get their first values at time 0, so an asynchronous reset asserted from the first cycle is
+    # an edge (x to its level) and acts at once, as RefKit's run has it act in cycle 0
+    tb = ["module tb;", f"  reg {clk} = 0;"] + [f"  reg {_rng(w)}{n};" for n, w in inputs.items()] + \
         [f"  wire {_rng(w)}{n};" for n, w in outputs.items()]
     pins = ([f".{clk}({clk})"] if clocked else []) + [f".{n}({n})" for n in [*inputs, *outputs]]
     tb.append(f"  dut u ({', '.join(pins)});")

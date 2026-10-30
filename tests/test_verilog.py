@@ -649,3 +649,17 @@ def test_a_function_defined_in_a_block_and_a_return_inside_a_match():
         self.out = self.q
 """, {"rst": 1, "sel": 2, "d": 8, "sign": 1}, {"flips": 1, "ones": 4, "ext": 12, "out": 1})
     same_as_run(src, [{"rst": 1, "sel": 0, "d": 0, "sign": 0}] + every({"sel": 2, "d": 8, "sign": 1}, 60, {"rst": 0}))
+
+
+@pytest.mark.skipif(not have_icarus, reason="Icarus Verilog not installed")
+def test_cosimulate_an_asynchronous_reset_asserted_from_the_first_cycle():
+    # RefKit's asynchronous reset acts in cycle 0 already; the co-simulation must see an edge for it to act in Verilog too
+    src = async_low(ref("""    tmp = Reg(8, init=B(1, 8))
+    @seq
+    def s(self):
+        self.tmp.next = self.tmp + 1
+    @comb
+    def o(self):
+        self.y = self.tmp
+""", {"rst_n": 1}, {"y": 8}, reset="rst_n"))
+    same_as_run(src, [{"rst_n": 0}, {"rst_n": 0}] + [{"rst_n": 1}] * 5)
