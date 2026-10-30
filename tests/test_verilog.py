@@ -519,3 +519,45 @@ def test_a_memory_cleared_by_an_asynchronous_reset():
     cycles += [{**c, "rst_n": 0 if i in (20, 21) else 1} for i, c in enumerate(every({"we": 1, "addr": 3, "raddr": 3, "d": 4}, 40))]
     same_as_run(src, cycles)
     assert "posedge clk or negedge rst_n" in translate(src).verilog
+
+
+EXHAUSTIVE = """    st = State("IDLE", "RUN", "DONE", reset="IDLE")
+    @seq
+    def fsm(self):
+        if self.st == "IDLE":
+            if self.go:
+                self.st.next = "RUN"
+        elif self.st == "RUN":
+            self.st.next = "DONE"
+        elif self.st == "DONE":
+            self.st.next = "IDLE"
+    @comb
+    def o(self):
+        match self.st.value:
+            case "IDLE":
+                self.status = B(0, 2)
+            case "RUN":
+                self.status = B(1, 2)
+            case "DONE":
+                self.status = B(2, 2)
+        match int(self.sel):
+            case 0:
+                self.be = B(1, 4)
+            case 1:
+                self.be = B(2, 4)
+            case 2 | 3:
+                self.be = B(12, 4) if self.sel[0] else B(4, 4)
+"""
+
+
+@pytest.mark.skipif(not have_icarus, reason="Icarus Verilog not installed")
+def test_a_match_or_elif_chain_that_covers_every_value_needs_no_default():
+    # the last case of a chain over every state of a State, or every value of a 2-bit number, is the one that runs when the
+    # others do not (an output set in every case is set on every path)
+    body = EXHAUSTIVE
+    src = ref(body, {"rst": 1, "go": 1, "sel": 2}, {"status": 2, "be": 4})
+    same_as_run(src, [{"rst": 1, "go": 0, "sel": 0}] + every({"go": 1, "sel": 2}, 40, {"rst": 0}))
+    # a chain that leaves a value out is still refused (the output would be a latch)
+    with pytest.raises(Unsupported, match="not set on every path"):
+        translate(ref(body.replace("            case 2 | 3:", "            case 2:"), {"rst": 1, "go": 1, "sel": 2},
+                      {"status": 2, "be": 4}))

@@ -116,6 +116,10 @@ class _Sym:
         self.bits_set: dict[str, int] = {}              # comb: net -> the bits set on the current path
         self.hw_depth = 0                               # hardware (non-constant) branches open at this point
         self.loop_depths: list[int] = []                # hw_depth at the entry of each loop being unrolled
+        # `subject == value` tests: the condition's text -> (the subject's text, the values it tests, every value the subject can
+        # have); and, on the current path, the values each subject is known not to have (the else paths taken to get here)
+        self.eq_tests: dict[str, tuple[str, frozenset, frozenset]] = {}
+        self.excluded: dict[str, frozenset] = {}
 
     # ── statements ──
     def run(self, body: list[ast.stmt]) -> None:
@@ -268,11 +272,13 @@ class _Sym:
             self.run(orelse)
             return
         saved_cond, saved_locals, saved_bits = self.condition, dict(self.locals), dict(self.bits_set)
+        saved_excluded = self.excluded
         self.hw_depth += 1
         try:
             self._both_paths(c, then, orelse, saved_cond, saved_locals, saved_bits)
         finally:
             self.hw_depth -= 1
+            self.excluded = saved_excluded
 
     def _both_paths(self, c: E, then: list[ast.stmt], orelse: list[ast.stmt], saved_cond: E, saved_locals: dict, saved_bits: dict) -> None:
         self.condition = _and(saved_cond, c)
@@ -280,6 +286,9 @@ class _Sym:
         then_locals, then_bits = self.locals, self.bits_set
         self.locals, self.bits_set = dict(saved_locals), dict(saved_bits)
         self.condition = _and(saved_cond, _not(c))
+        test = self.eq_tests.get(c.text)
+        if test is not None:                  # the else path of `subject == v`: the subject is not v here
+            self.excluded = {**self.excluded, test[0]: self.excluded.get(test[0], frozenset()) | test[1]}
         self.run(orelse)
         else_locals, else_bits = self.locals, self.bits_set
         self.bits_set = {n: then_bits.get(n, 0) & else_bits.get(n, 0) for n in set(then_bits) | set(else_bits)}
@@ -326,13 +335,14 @@ class _Sym:
         for case in st.cases:
             if case.guard is not None:
                 raise Unsupported("case guard")
-            chain.append((self.pattern(subject, case.pattern), case.body))
+            chain.append((subject, case.pattern, case.body))
         self._chain(chain)
 
-    def _chain(self, chain: list[tuple[E | None, list[ast.stmt]]]) -> None:
+    def _chain(self, chain: list[tuple[ast.expr, ast.pattern, list[ast.stmt]]]) -> None:
         if not chain:
             return
-        cond, body = chain[0]
+        subject, pattern, body = chain[0]
+        cond = self.pattern(subject, pattern)      # here, on the path where the cases before did not match
         if cond is None:
             self.run(body)
             return
@@ -345,7 +355,7 @@ class _Sym:
             parts = [self.pattern(subject, q) for q in p.patterns]
             if any(x is None for x in parts):
                 return None
-            return E("(" + " || ".join(x.text for x in parts) + ")", 1, True)  # type: ignore[union-attr]
+            return self.any_of(parts)  # type: ignore[arg-type]
         if isinstance(p, ast.MatchValue):
             return self.compare(subject, ast.Eq(), p.value)
         raise Unsupported(f"case pattern {ast.unparse(p)}")
@@ -543,13 +553,14 @@ class _Sym:
     def compare(self, left: ast.expr, op: ast.cmpop, right: ast.expr) -> E:
         if isinstance(op, (ast.In, ast.NotIn)) and isinstance(right, (ast.Tuple, ast.List, ast.Set)) and right.elts:
             parts = [self.compare(left, ast.Eq(), e) for e in right.elts]
-            any_of = E("(" + " || ".join(p.text for p in parts) + ")", 1, True)
+            any_of = self.any_of(parts)
             return any_of if isinstance(op, ast.In) else _not(any_of)
         # a local holding a state compared with a name
         held = self.locals.get(left.id) if isinstance(left, ast.Name) else None
         if isinstance(held, _StateE) and isinstance(op, (ast.Eq, ast.NotEq)):
             code = held.code(self.py(right))
-            return E(f"({held.text} {'==' if isinstance(op, ast.Eq) else '!='} {code.text})", 1, True)
+            return self.eq_test(held.text, held.names.index(self.py(right)), len(held.names),
+                                E(f"({held.text} {'==' if isinstance(op, ast.Eq) else '!='} {code.text})", 1, True), op)
         # a state register compared with a name
         state = _state_ref(left)
         if state is not None and state in self.ctx.states:
@@ -559,7 +570,8 @@ class _Sym:
             code = f"{state.upper()}__{name}"
             if not isinstance(op, (ast.Eq, ast.NotEq)):
                 raise Unsupported("a state compared with < or >")
-            return E(f"({state} {'==' if isinstance(op, ast.Eq) else '!='} {code})", 1, True)
+            return self.eq_test(state, self.ctx.states[state].index(name), len(self.ctx.states[state]),
+                                E(f"({state} {'==' if isinstance(op, ast.Eq) else '!='} {code})", 1, True), op)
         # signed comparisons through .signed on both sides (or a constant)
         if _is_signed(left) or _is_signed(right):
             a, b = self.signed_operand(left), self.signed_operand(right)
@@ -569,7 +581,52 @@ class _Sym:
         ops = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!="}
         if type(op) not in ops:
             raise Unsupported(f"comparison {type(op).__name__}")
-        return E(f"({_num(a)} {ops[type(op)]} {_num(b)})", 1, True)
+        out = E(f"({_num(a)} {ops[type(op)]} {_num(b)})", 1, True)
+        # only a subject whose value has its own width (a name, a select, a cast, a concatenation: not `a + b`, which a
+        # comparison evaluates wider) has at most 2**width values
+        if isinstance(op, (ast.Eq, ast.NotEq)) and a.width <= 12 and (
+                isinstance(a, _In) or re.fullmatch(r"[A-Za-z_][\w$]*(\[[^\]]*\])?|(\d+'|__rk2s_\d+)\(.*\)|\{.*\}", a.text)):
+            try:
+                value = self.int_of(right)
+            except Unsupported:
+                return out
+            return self.eq_test(a.text, value, 1 << a.width, out, op)
+        return out
+
+    def eq_test(self, subject: str, value: int, count: int, e: E, op: ast.cmpop) -> E:
+        """`subject == value` (or !=), whose subject has the values 0 .. count-1: true or false at translation time when the else
+        paths taken to get here leave only that value or exclude it (the last case of a `match` or `if`/`elif` chain that covers
+        every value of a State register or of a narrow number is the case that runs when the others do not), else `e`."""
+        excluded = self.excluded.get(subject, frozenset())
+        equal: bool | None = None
+        if value in excluded or not 0 <= value < count:
+            equal = False
+        elif len(excluded | {value}) == count and all(0 <= v < count for v in excluded):
+            equal = True
+        if equal is not None:
+            truth = equal if isinstance(op, ast.Eq) else not equal
+            return E("1'b1" if truth else "1'b0", 1, True)
+        if isinstance(op, ast.Eq):
+            self.eq_tests[e.text] = (subject, frozenset({value}), frozenset(range(count)))
+        return e
+
+    def any_of(self, parts: list[E]) -> E:
+        """`a || b || ...` of conditions; `subject == v1 || subject == v2` tests the values v1, v2 of one subject."""
+        if any(p.text == "1'b1" for p in parts):
+            return E("1'b1", 1, True)
+        parts = [p for p in parts if p.text != "1'b0"]
+        if not parts:
+            return E("1'b0", 1, True)
+        e = E("(" + " || ".join(p.text for p in parts) + ")", 1, True)
+        tests = [self.eq_tests.get(p.text) for p in parts]
+        if all(t is not None for t in tests) and len({t[0] for t in tests}) == 1:  # type: ignore[index]
+            values = frozenset().union(*(t[1] for t in tests))  # type: ignore[index]
+            subject, universe = tests[0][0], tests[0][2]  # type: ignore[index]
+            excluded = self.excluded.get(subject, frozenset())
+            if universe <= excluded | values:
+                return E("1'b1", 1, True)
+            self.eq_tests[e.text] = (subject, values, universe)
+        return e
 
     def signed_operand(self, node: ast.expr) -> str:
         if _is_signed(node):

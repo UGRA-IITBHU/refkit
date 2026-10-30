@@ -399,3 +399,14 @@ failed only because of x, and 9 had references the translator refused.
   reset value keep their writes in the plain clocked block. Co-simulated against RefKit (test, reset asserted mid-run); all 47
   newly translated stored references agree with RefKit's run. Formal: Yosys reads it; a wrong RTL (other reset value) is refuted,
   a right one ends `unknown` (k-induction does not close over the memory within depth 24), never a false `proven`.
+- **T5. A `match` or `if`/`elif` chain that covers every value, with no default. fixed.** `match self.st.value` with a case for
+  every state, or `match int(sel)` with a case for each of the four values of a 2-bit `sel`, has no path on which no case
+  matches, but the translator merged it as `?:` with a last "none matched" arm and refused an output set in every case ("some
+  bits of o_fsm_status are not set on every path": 23 stored references RefKit runs, most of concatenate_0001). The translator
+  now keeps, per path, the values each subject is known not to have (the else paths of `subject == value` taken to get there)
+  and decides a test at translation time when they leave one value (true) or exclude it (false). Subjects: a State register, a
+  local that holds a state, and a number whose value has its own width (a name, a select, a cast, a concatenation, 12 bits at
+  most; not `a + b`, which a comparison evaluates wider). Right because the state register only ever holds one of its codes
+  and a w-bit value only 2**w values (inputs are two-state, T3). A chain that leaves a value out is still refused. Formal: a
+  state code that is not a state is unreachable from reset; the induction may then not close (`unknown`), it cannot prove a
+  wrong RTL. Test co-simulates against RefKit; the 21 references this newly translates all agree with RefKit's run.
