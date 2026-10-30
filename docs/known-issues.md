@@ -450,3 +450,8 @@ failed only because of x, and 9 had references the translator refused.
   `int(self.CONST)` as a case pattern, a constant that is a state name, `None` (don't-care) outputs: one to five references each.
 - **Division by zero (open, small).** RefKit gives all ones for `x / 0` and `x % 0`; the translation emits Verilog `/` and `%`,
   which give x. A reference that divides by an input that can be 0 differs from RefKit there.
+- **T11. A Python error inside the translator. fixed (reported as Unsupported).** 13 stored references made the translator
+  itself fail (`int('IDLE')` for a `Reg` given a state name as reset value, a negative shift count), raising ValueError where
+  callers catch `Unsupported`. `translate` now reports such a failure as `Unsupported` ("the translator could not follow the
+  reference ..."). Test. Also fixed in this commit: the register-name clash check of T10 counted `Input(...)` declarations of
+  the class itself as clashes; it now looks only at registers, State, memories and wires.

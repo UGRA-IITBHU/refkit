@@ -1154,7 +1154,17 @@ def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "c
     integers and RefKit gives an input no one sets the value 0, so this is the reference's own meaning of such an input; without it
     an input a testbench leaves undriven turns into x in every `?:` and comparison the translation is made of (where hand-written
     `if`/`case` RTL would take a branch) and the reference is scored on that x instead of on its logic. For two-state inputs (the
-    formal proof, `cosimulate`) both forms are the same function. False reads the ports as they are (x propagates)."""
+    formal proof, `cosimulate`) both forms are the same function. False reads the ports as they are (x propagates).
+
+    A construct the translator does not follow raises `Unsupported`, also when following it fails inside the translator (a Python
+    error there, e.g. a state name where a number is expected), so a caller needs to catch only that."""
+    try:
+        return _translate(source, module_name, clock_name, two_state_inputs)
+    except (ValueError, TypeError, IndexError, KeyError, AttributeError) as error:
+        raise Unsupported(f"the translator could not follow the reference ({type(error).__name__}: {error})") from error
+
+
+def _translate(source: str, module_name: str, clock_name: str, two_state_inputs: bool) -> Translation:
     ns: dict[str, Any] = {}
     try:
         exec(compile(source, "<reference>", "exec"), ns)  # noqa: S102
@@ -1188,7 +1198,7 @@ def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "c
     # a Reg() declared without a width has the width of its output port, or 32 bits (as RefKit runs it)
     decls = {n: (rk.Reg(outputs.get(n, rk.NUMBER_WIDTH), d.reset, d.init) if isinstance(d, rk.Reg) and d.width is None else d)
              for n, d in cls._decls.items()}
-    clash = sorted(n for n in decls if n in inputs)
+    clash = sorted(n for n, d in decls.items() if n in inputs and isinstance(d, (rk.Reg, rk.State, rk.Mem, rk.Wire)))
     if clash:                       # a Verilog module cannot declare a register with the name of one of its ports
         raise Unsupported(f"a register, wire or memory named like the input {clash[0]}")
     ctx = _Ctx(cls, decls, inputs, outputs)

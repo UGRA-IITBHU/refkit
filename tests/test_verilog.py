@@ -676,3 +676,21 @@ def test_a_register_named_like_an_input_is_refused_not_emitted():
 """, {"rst": 1, "en": 1}, {"y": 1})
     with pytest.raises(Unsupported, match="named like the input en"):
         translate(src)
+    # an input declared in the class (Input) is the port itself, not a clash
+    declared = src.replace("    en = Reg(1)\n", "    en = Input(1)\n    r = Reg(1)\n").replace("self.en.next", "self.r.next") \
+        .replace("self.y = self.en", "self.y = self.en & self.r")
+    translate(declared)
+
+
+def test_a_python_error_inside_the_translator_is_unsupported():
+    # a Reg given a state name as its reset value (a State was meant): the translator's int() fails; the caller sees Unsupported
+    src = ref("""    state = Reg(2, reset="IDLE")
+    @seq
+    def s(self):
+        self.state.next = 0
+    @comb
+    def o(self):
+        self.y = self.state
+""", {"rst": 1}, {"y": 2})
+    with pytest.raises(Unsupported, match="could not follow"):
+        translate(src)
