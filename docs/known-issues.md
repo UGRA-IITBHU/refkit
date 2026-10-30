@@ -424,3 +424,11 @@ failed only because of x, and 9 had references the translator refused.
   (`__tN`) was declared without a range when it is 1 bit wide, and `__tN[0]` (the sign bit of a 1-bit value sign-extended,
   `x.sext(8)`, or `x.sext(1)`) is "can not select part of scalar" in Icarus: the translation did not compile (found with T6:
   unpacker references sign-extend single bits). Temporaries are now always declared with a range (`[0:0]`). Test.
+- **T8. A function defined inside a block; a `return` inside a `match`. fixed.** `def popcount(v): ...; return c` or
+  `def extend(x, w): return x.sext(w) if self.sign else x.zext(w)` inside a `@comb` block (dbi_0001, unpacker_one_hot_0001)
+  was refused as "a return inside FunctionDef": the return of the helper was taken for a return of the block. A helper defined
+  in a block is now inlined where it is called, seeing the block's locals as they are at the call (a closure, as Python runs
+  it); it must end with its only return, like a helper method. A bare `return` inside a `case` of a `match` in a block
+  (clock_divider_0003, apb_history_shift_register_0001) is lifted as one inside an `if` was: the statements after the `match`
+  run in every case that did not return, and in the case of no match when there is no `case _`. 12 more stored references
+  translate, all agree with RefKit's run. Test.

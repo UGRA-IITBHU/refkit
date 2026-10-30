@@ -611,3 +611,41 @@ def test_a_one_bit_expression_sign_extended():
     cycles = [{"a": a, "b": b} for a in (0, 1) for b in (0, 1)]
     want = [run(ns["Ref"], [c], widths={"y": 8, "z": 1}, inputs={"a": 1, "b": 1})[0] for c in cycles]
     assert cosimulate(src, cycles) == want
+
+
+@pytest.mark.skipif(not have_icarus, reason="Icarus Verilog not installed")
+def test_a_function_defined_in_a_block_and_a_return_inside_a_match():
+    src = ref("""    cnt = Reg(3, reset=0)
+    q = Reg(1, reset=0)
+    prev = Reg(8, reset=0)
+    @seq
+    def s(self):
+        self.prev.next = self.d
+        match int(self.sel):
+            case 3:
+                self.cnt.next = 0
+                self.q.next = 0
+                return
+            case 0:
+                if self.d[0]:
+                    return
+        if self.cnt == self.sel:
+            self.cnt.next = 0
+            self.q.next = ~self.q
+        else:
+            self.cnt.next = self.cnt + 1
+    @comb
+    def o(self):
+        def popcount(v):
+            c = 0
+            for i in range(v.width):
+                c += v[i]
+            return c
+        def extend(x, w):
+            return x.sext(w) if self.sign else x.zext(w)
+        self.flips = popcount(self.d ^ self.prev) > 4
+        self.ones = popcount(self.d)
+        self.ext = cat(extend(self.d[3:0], 6), extend(self.d[7:4], 6))
+        self.out = self.q
+""", {"rst": 1, "sel": 2, "d": 8, "sign": 1}, {"flips": 1, "ones": 4, "ext": 12, "out": 1})
+    same_as_run(src, [{"rst": 1, "sel": 0, "d": 0, "sign": 0}] + every({"sel": 2, "d": 8, "sign": 1}, 60, {"rst": 0}))

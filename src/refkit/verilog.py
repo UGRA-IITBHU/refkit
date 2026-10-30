@@ -64,8 +64,11 @@ class _StateE(E):
 def _lift_returns(body: list[ast.stmt]) -> list[ast.stmt]:
     """A block body whose `return` (no value) ends it early, rewritten without the return: the statements after an `if` that
     returns on some path run in the paths that do not, as Python runs them."""
-    def returns(st: ast.stmt) -> bool:
-        return any(isinstance(n, ast.Return) for n in ast.walk(st))
+    def returns(st: ast.AST) -> bool:
+        # the returns of the block itself: a function defined inside it returns from that function
+        if isinstance(st, (ast.FunctionDef, ast.Lambda)):
+            return False
+        return isinstance(st, ast.Return) or any(returns(n) for n in ast.iter_child_nodes(st))
 
     out: list[ast.stmt] = []
     for i, st in enumerate(body):
@@ -77,6 +80,16 @@ def _lift_returns(body: list[ast.stmt]) -> list[ast.stmt]:
             rest = body[i + 1:]
             out.append(ast.If(test=st.test, body=_lift_returns(st.body + rest) or [ast.Pass()],
                               orelse=_lift_returns(st.orelse + rest)))
+            return out
+        if isinstance(st, ast.Match) and returns(st):
+            # each case runs the statements after the match unless it returned; so does the case of no match, if there is one
+            rest = body[i + 1:]
+            cases = [ast.match_case(pattern=c.pattern, guard=c.guard, body=_lift_returns(c.body + rest) or [ast.Pass()])
+                     for c in st.cases]
+            if not any(isinstance(c.pattern, ast.MatchAs) and c.pattern.pattern is None and c.guard is None for c in st.cases):
+                cases.append(ast.match_case(pattern=ast.MatchAs(pattern=None, name=None), guard=None,
+                                            body=_lift_returns(list(rest)) or [ast.Pass()]))
+            out.append(ast.Match(subject=st.subject, cases=cases))
             return out
         if returns(st):
             raise Unsupported(f"a return inside {type(st).__name__}")
@@ -157,6 +170,9 @@ class _Sym:
             raise _Continue()
         if isinstance(st, ast.Match):
             self.match(st)
+            return
+        if isinstance(st, ast.FunctionDef) and not st.decorator_list:
+            self.locals[st.name] = _LocalFn(st)        # a helper defined inside the block: inlined where it is called
             return
         if isinstance(st, ast.For):
             self.loop(st)
@@ -754,6 +770,8 @@ class _Sym:
     def call(self, node: ast.Call) -> E:
         f = node.func
         if isinstance(f, ast.Name):
+            if isinstance(self.locals.get(f.id), _LocalFn):
+                return self.inline_local(self.locals[f.id], node)
             if f.id == "B":
                 w = self.int_of(node.args[1])
                 try:
@@ -874,6 +892,24 @@ class _Sym:
         inner.run(body[:-1])
         return inner.expr(body[-1].value)  # type: ignore[arg-type]
 
+    def inline_local(self, fn: "_LocalFn", node: ast.Call) -> E:
+        """A call of a function defined inside the block, inlined: it sees the block's locals as they are now (a closure)."""
+        tree = fn.tree
+        params = [a.arg for a in tree.args.args]
+        if len(params) != len(node.args) or node.keywords or tree.args.vararg or tree.args.kwarg or tree.args.defaults:
+            raise Unsupported(f"call of {tree.name} with keywords, defaults or a different number of arguments")
+        body = tree.body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            body = body[1:]                                                    # a docstring
+        if not body or not isinstance(body[-1], ast.Return) or body[-1].value is None \
+                or any(isinstance(n, ast.Return) for s in body[:-1] for n in ast.walk(s)):
+            raise Unsupported(f"{tree.name} must end with its only return")
+        inner = _Sym(self.ctx, "pure")
+        inner.assigned, inner.excluded = self.assigned, self.excluded
+        inner.locals = {**self.locals, **{p: self.value_of(a) for p, a in zip(params, node.args)}}
+        inner.run(body[:-1])
+        return inner.expr(body[-1].value)
+
     def state_value(self, reg: str, node: ast.expr) -> E:
         if isinstance(node, ast.IfExp):
             c = self.cond(node.test)
@@ -917,6 +953,16 @@ _Sym.stmt = _stmt  # type: ignore[method-assign]
 
 class _Seq(list):
     """A local that holds a Python list built at translation time (its elements are expressions or Python values)."""
+
+
+class _LocalFn:
+    """A function defined inside a block (`def popcount(v): ...`)."""
+
+    def __init__(self, tree: ast.FunctionDef) -> None:
+        self.tree = tree
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _LocalFn) and other.tree is self.tree
 
 
 class _Diverged:
