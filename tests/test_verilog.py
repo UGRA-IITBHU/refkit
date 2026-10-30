@@ -67,7 +67,8 @@ def test_translation_is_verilog_yosys_accepts(tmp_path):
         done = subprocess.run([_tool("yosys"), "-q", "-p", "read_verilog -sv r.sv; prep -top refkit_ref"], cwd=tmp_path,
                               capture_output=True, text=True)
         assert done.returncode == 0, done.stderr + t.verilog
-    assert "9'((a + b))" in translate(FSM).verilog            # the carry kept, as RefKit keeps it
+    assert "9'((__rk2s_8(a) + __rk2s_8(b)))" in translate(FSM).verilog            # the carry kept, as RefKit keeps it
+    assert "9'((a + b))" in translate(FSM, two_state_inputs=False).verilog
 
 
 def test_unsupported_constructs_are_refused():
@@ -426,3 +427,69 @@ def test_a_register_named_like_a_verilog_keyword():
         self.q = self.buf
 """, {"rst": 1, "d": 4}, {"q": 4})
     same_as_run(src, every({"d": 4}, 30, {"rst": 0}))
+
+
+DIVIDER = ref("""    cnt = Reg(3, reset=0)
+    q = Reg(1, reset=0)
+    @seq
+    def s(self):
+        if self.sel == 3:
+            self.cnt.next = 0
+            self.q.next = 0
+        else:
+            n = 1 if self.sel == 0 else 2 if self.sel == 1 else 4
+            if self.cnt + 1 >= n:
+                self.cnt.next = 0
+                self.q.next = ~self.q
+            else:
+                self.cnt.next = self.cnt + 1
+    @comb
+    def o(self):
+        self.clk_out = self.q
+        self.busy = self.go and self.sel != 3
+""", {"rst": 1, "sel": 2, "go": 1}, {"clk_out": 1, "busy": 1})
+
+
+def undriven_run(source: str, two_state: bool) -> list[str]:
+    """The translation in Icarus with every input but the reset left undriven (z), as a cocotb test leaves an input it never sets."""
+    import tempfile
+    t = translate(source, "dut", two_state_inputs=two_state)
+    tb = ("module tb; reg clk = 0; reg rst = 1; wire clk_out, busy;\n"
+          "  dut u (.clk(clk), .rst(rst), .sel(), .go(), .clk_out(clk_out), .busy(busy));\n"
+          "  initial begin repeat (2) begin #5 clk = 1; #5 clk = 0; end rst = 0;\n"
+          "    repeat (6) begin #5 $display(\"%b%b\", clk_out, busy); clk = 1; #5 clk = 0; end $finish; end\nendmodule\n")
+    with tempfile.TemporaryDirectory() as d:
+        Path(d, "dut.v").write_text(t.verilog)
+        Path(d, "tb.v").write_text(tb)
+        subprocess.run([_tool("iverilog"), "-g2012", "-o", f"{d}/sim", f"{d}/dut.v", f"{d}/tb.v"], check=True)
+        out = subprocess.run([_tool("vvp"), "-n", f"{d}/sim"], capture_output=True, text=True, check=True).stdout
+        return [w for w in out.split() if len(w) == 2 and set(w) <= set("01xz")]
+
+
+@pytest.mark.skipif(not have_icarus, reason="Icarus Verilog not installed")
+def test_an_input_left_undriven_reads_as_0_as_refkit_reads_it():
+    # Undriven inputs read as 0, the value RefKit's runs start every input at (sel = 0 divides by 1: clk_out toggles every cycle,
+    # busy is 0); the ports read as they are, the x of the undriven sel goes through `sel == 3 ? ...` into the registers.
+    ns: dict = {}
+    exec(DIVIDER, ns)
+    zero = {"sel": 0, "go": 0}
+    want = run(ns["Ref"], [{"rst": 1, **zero}] * 2 + [{"rst": 0, **zero}] * 6, reset="rst", widths={"clk_out": 1, "busy": 1},
+               inputs={"rst": 1, "sel": 2, "go": 1})[2:]
+    assert [f"{w['clk_out']}{w['busy']}" for w in want] == ["00", "10", "00", "10", "00", "10"]
+    assert undriven_run(DIVIDER, True) == ["00", "10", "00", "10", "00", "10"]
+    assert all("x" in v for v in undriven_run(DIVIDER, False)[1:])
+    same_as_run(DIVIDER, [{"rst": 1, **zero}] + every({"sel": 2, "go": 1}, 40, {"rst": 0}))
+
+
+@pytest.mark.skipif(not have_tools, reason="SymbiYosys not available")
+def test_two_state_inputs_keep_the_proof(tmp_path):
+    rtl = ("module TopModule(input clk, input rst, input [1:0] sel, input go, output reg clk_out, output busy);\n"
+           "  reg [2:0] cnt;\n"
+           "  wire [2:0] n = sel == 0 ? 3'd1 : sel == 1 ? 3'd2 : 3'd4;\n"
+           "  always @(posedge clk) if (rst) begin cnt <= 0; clk_out <= 0; end\n"
+           "    else if (sel == 3) begin cnt <= 0; clk_out <= 0; end\n"
+           "    else if (cnt + 3'd1 >= n) begin cnt <= 0; clk_out <= ~clk_out; end else cnt <= cnt + 3'd1;\n"
+           "  assign busy = go && sel != 3;\nendmodule\n")
+    assert prove(DIVIDER, rtl, "TopModule", "clk", workdir=tmp_path / "r").status == "proven"
+    wrong = rtl.replace("sel == 1 ? 3'd2", "sel == 1 ? 3'd3")
+    assert prove(DIVIDER, wrong, "TopModule", "clk", workdir=tmp_path / "w").status == "refuted"

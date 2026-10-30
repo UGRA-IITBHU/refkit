@@ -369,3 +369,27 @@ the deep stimulus. Nothing was changed after seeing it.
 - Verilog: the arbiter route delivers fewer (19 against 21) because a function that stays a function cannot be translated, and several right references use constructs the translator refuses (countbcd: and/or whose value is a multi-bit number; dualedge: rising and falling edges in one module; ece241_2014_q5b: some bits of an output not set on every path).
 - Wrong in all three: edgedetect2, edgedetect, ece241_2014_q4, rule110, 2014_q3fsm, fsm_hdlc, circuit8, circuit10, ece241_2013_q4, lemmings3, review2015_fancytimer.
 - Reading: on the test half RefKit is not better than the function by more than noise (the dev half showed +4), and the arbiter route does not improve on RefKit alone. By the rule of section 14 (keep a change only if fixed minus broke is at least +2 with the time under 2x) the arbiter and translator are not kept as a gain: +1 -2 against RefKit alone on 37 problems, at an extra 2,042 s. The dev-half lead of RefKit over the function (26 against 22 on the deep stimulus) did not reproduce at that size on the untouched half, which fits a guide tuned on dev.
+
+## 16. Translator: x-pessimism and constructs it refused (2026-10-30, branch `translator-fixes`)
+
+From the CVDP spec audit in BARG (`docs/cvdp-spec-audit.md`): 4 of the 27 audited problems had logically right references that
+failed only because of x, and 9 had references the translator refused.
+
+- **T3. X-pessimism of the translation. fixed (two-state inputs, the default).** The translation is made of `?:` and comparisons,
+  so an input a testbench leaves undriven (z, read as x) turned into x in every register it reached (CVDP: `sel` of
+  clock_divider_0003, `data_valid` of data_width_converter_0003, the unselected `select_*` of events_to_apb_0001, `start` of
+  factorial_0001), where hand-written `if`/`case` RTL takes a branch. The translated module now reads every input through a
+  function `__rk2s_W(v)` that turns each x or z bit into 0. Why this and not `if`/`case` code: RefKit has no x; its values are
+  integers, its runs start every input at 0 (`run_stepped`, `cosimulate`'s testbench) and the BARG harness gives an input
+  nobody sets 0. Mapping x/z to 0 is the IEEE 1800 conversion of a four-state value to a two-state one (6.24.1), so the module
+  is the reference's own two-state function, applied to the two-state reading of its ports. Procedural `if`/`case` would only
+  copy the x-optimism of hand-written RTL (`if (x)` takes the else branch, which is neither 0 nor 1 semantics: `if (sel == 0)`
+  is false for x while RefKit's sel = 0 makes it true). The function is applied where the input is read (no `assign` to a
+  sanitised wire), so it adds no delta cycle: a register samples the port itself, and races with a testbench are what they
+  were. The clock and the asynchronous reset in the sensitivity list stay raw; the reset level test reads the two-state value.
+  Formal: for two-state inputs (SymbiYosys) the function is the identity, so the miter proves the same thing; tested (a right
+  RTL proven, a wrong one refuted). `translate(..., two_state_inputs=False)` gives the old four-state reading.
+  Measured: of the stored references of the four problems that translate and are clocked, 201 showed x on an output 16
+  cycles after reset with every other input undriven, 0 do with the fix (Icarus, read-only on the BARG work folders); the
+  CVDP scoring itself (cocotb in docker) was not rerun here. What it does not do: an x that the testbench drives explicitly
+  also reads 0, so a test that checks that x propagates would see a difference (none known).

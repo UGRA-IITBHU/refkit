@@ -476,7 +476,7 @@ class _Sym:
                 raise Unsupported("a state register used as a number")
             key = name[:-1] if name.endswith("_") and name not in ctx.inputs and name[:-1] in ctx.inputs else name
             if key in ctx.inputs:
-                return E(_vname(key), ctx.inputs[key])
+                return _input(key, ctx.inputs[key])
             v = getattr(ctx.cls, name, _MISSING)
             if isinstance(v, int) and not isinstance(v, bool):
                 return _const(v)
@@ -590,12 +590,12 @@ class _Sym:
         v = self.expr(base)
         if isinstance(node.slice, ast.Slice):
             hi, lo = self.int_of(node.slice.lower), self.int_of(node.slice.upper)
-            return E(f"{_sel(v)}[{hi}:{lo}]", hi - lo + 1)
+            return E(_bits(v, f"{hi}:{lo}", hi - lo + 1), hi - lo + 1)
         try:
             i = self.int_of(node.slice)
-            return E(f"{_sel(v)}[{i}]", 1)
+            return E(_bits(v, str(i), 1), 1)
         except Unsupported:
-            return E(f"{_sel(v)}[{self.expr(node.slice).text}]", 1)
+            return E(_bits(v, self.expr(node.slice).text, 1), 1)
 
     def call(self, node: ast.Call) -> E:
         f = node.func
@@ -633,12 +633,12 @@ class _Sym:
             if method == "zext":
                 w = self.int_of(args[0])
                 return E(_sized(v) if w == v.width else f"{{{{{w - v.width}{{1'b0}}}}, {_sized(v)}}}" if w > v.width
-                         else f"{_sel(v)}[{w - 1}:0]", w)
+                         else _bits(v, f"{w - 1}:0", w), w)
             if method == "sext":
                 w = self.int_of(args[0])
                 if w <= v.width:
-                    return E(f"{_sel(v)}[{w - 1}:0]", w)
-                return E(f"{{{{{w - v.width}{{{_sel(v)}[{v.width - 1}]}}}}, {_sized(v)}}}", w)
+                    return E(_bits(v, f"{w - 1}:0", w), w)
+                return E(f"{{{{{w - v.width}{{{_bits(v, str(v.width - 1), 1)}}}}}, {_sized(v)}}}", w)
             if method in ("shift_in_low", "shift_in_high"):
                 try:
                     new = E(f"1'b{int(self.py(args[0])) & 1}", 1)
@@ -672,10 +672,10 @@ class _Sym:
                 return E(f"(~({_num(v)} ^ {_num(b)}))", max(v.width, b.width))
             if method == "part":
                 base, w = self.expr(args[0]), self.int_of(args[1])
-                return E(f"{_sel(v)}[{base.text} +: {w}]", w)
+                return E(_bits(v, f"{base.text} +: {w}", w), w)
             if method == "part_down":
                 base, w = self.expr(args[0]), self.int_of(args[1])
-                return E(f"{_sel(v)}[{base.text} -: {w}]", w)
+                return E(_bits(v, f"{base.text} -: {w}", w), w)
             if method in ("slt", "sle", "sgt", "sge"):
                 b = self.expr(args[0])
                 w = max(v.width, b.width)
@@ -790,7 +790,49 @@ def _temp(e: E) -> str:
 
 def _sized(e: E) -> str:
     """The expression at its own width (SystemVerilog cast; a concatenation operand is self-determined anyway)."""
-    return e.text if _IDENT.fullmatch(e.text) else f"{e.width}'({e.text})"
+    return e.text if _IDENT.fullmatch(e.text) or isinstance(e, _In) else f"{e.width}'({e.text})"
+
+
+# Inputs are read as two-state values (RefKit's values are integers): every x or z bit of an input reads as 0, the IEEE 1800
+# conversion of a four-state value to a two-state one (6.24.1), and what RefKit itself assumes of an input nobody gives a value.
+# The conversion is a function applied where the input is read, so it adds no delta cycle: a register samples the input itself.
+_TWO_STATE: dict[str, Any] = {"on": True, "widths": set()}
+
+
+@dataclass
+class _In(E):
+    """An input port as read by the translation (`raw` is the port's name)."""
+
+    raw: str = ""
+
+
+def _two_state(text: str, width: int) -> str:
+    if not _TWO_STATE["on"]:
+        return text
+    _TWO_STATE["widths"].add(width)
+    return f"__rk2s_{width}({text})"
+
+
+def _input(name: str, width: int) -> E:
+    return _In(_two_state(name, width), width, raw=name)
+
+
+def _bits(e: E, select: str, width: int) -> str:
+    """`e[select]` (a bit, a range or an indexed part select of `width` bits); an input's bits are selected from the port."""
+    if isinstance(e, _In):
+        return _two_state(f"{e.raw}[{select}]", width)
+    return f"{_sel(e)}[{select}]"
+
+
+def _two_state_functions() -> list[str]:
+    out = []
+    for w in sorted(_TWO_STATE["widths"]):
+        if w == 1:
+            out.append("  function __rk2s_1(input v); __rk2s_1 = (v === 1'b1); endfunction")
+        else:
+            out.append(f"  function [{w - 1}:0] __rk2s_{w}(input [{w - 1}:0] v); integer i; begin "
+                       f"for (i = 0; i < {w}; i = i + 1) __rk2s_{w}[i] = (v[i] === 1'b1); end endfunction")
+    return out
 
 
 def _sel(e: E) -> str:
@@ -800,7 +842,7 @@ def _sel(e: E) -> str:
 def _sext(e: E, w: int) -> str:
     if w == e.width:
         return _sized(e)
-    return f"{{{{{w - e.width}{{{_sel(e)}[{e.width - 1}]}}}}, {_sized(e)}}}"
+    return f"{{{{{w - e.width}{{{_bits(e, str(e.width - 1), 1)}}}}}, {_sized(e)}}}"
 
 
 def _fit(e: E, width: int) -> E:
@@ -826,10 +868,10 @@ def _not(c: E) -> E:
 def _splice(current: E, hi: int, lo: int, part: E, width: int) -> E:
     pieces = []
     if hi < width - 1:
-        pieces.append(f"{_sel(current)}[{width - 1}:{hi + 1}]")
+        pieces.append(_bits(current, f"{width - 1}:{hi + 1}", width - 1 - hi))
     pieces.append(_sized(part))
     if lo > 0:
-        pieces.append(f"{_sel(current)}[{lo - 1}:0]")
+        pieces.append(_bits(current, f"{lo - 1}:0", lo))
     return E("{" + ", ".join(pieces) + "}", width)
 
 
@@ -874,9 +916,16 @@ class Translation:
     edge: str = "posedge"
 
 
-def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "clk") -> Translation:
+def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "clk", *,
+              two_state_inputs: bool = True) -> Translation:
     """The Verilog of a completed RefKit reference (one that carries `__refkit__`). `clock_name` is the name of the clock port of the
-    translated module (the block's own, e.g. `CLK`); the miter always uses `clk`."""
+    translated module (the block's own, e.g. `CLK`); the miter always uses `clk`.
+
+    `two_state_inputs` (the default): every input is read as a two-state value, an x or z bit as 0. A RefKit reference computes on
+    integers and RefKit gives an input no one sets the value 0, so this is the reference's own meaning of such an input; without it
+    an input a testbench leaves undriven turns into x in every `?:` and comparison the translation is made of (where hand-written
+    `if`/`case` RTL would take a branch) and the reference is scored on that x instead of on its logic. For two-state inputs (the
+    formal proof, `cosimulate`) both forms are the same function. False reads the ports as they are (x propagates)."""
     ns: dict[str, Any] = {}
     try:
         exec(compile(source, "<reference>", "exec"), ns)  # noqa: S102
@@ -887,6 +936,7 @@ def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "c
         raise Unsupported("not a completed RefKit reference")
     cls = meta["module"]
     _TEMPS.clear()
+    _TWO_STATE["on"], _TWO_STATE["widths"] = two_state_inputs, set()
     if not isinstance(cls, type) or not issubclass(cls, rk.Module):
         raise Unsupported("only Module references are translated")
     edges = {getattr(f, "_refkit_edge", "pos") for f in cls._seq}
@@ -970,7 +1020,7 @@ def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "c
             sym.run(_lift_returns(_function_ast(cls, block.__name__).body))
         reset = meta["reset"]
         active = int(meta["active"])
-        level = f"({_vname(reset)} == 1'b{active})" if reset is not None else None
+        level = f"({_two_state(reset, 1)} == 1'b{active})" if reset is not None else None
         style = meta["style"]
         resettable = {n for n, d in decls.items()
                       if (isinstance(d, rk.Reg) and d.reset is not None) or isinstance(d, rk.State)}
@@ -1016,7 +1066,7 @@ def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "c
             lines += body
             lines.append("  end")
     lines.append("endmodule")
-    out = lines[:declarations_end] + [d for d, _ in _TEMPS] + lines[declarations_end:-1] + [a for _, a in _TEMPS] + lines[-1:]
+    out = lines[:declarations_end] + _two_state_functions() + [d for d, _ in _TEMPS] + lines[declarations_end:-1] + [a for _, a in _TEMPS] + lines[-1:]
     verilog = _rename_keywords("\n".join(out) + "\n", list(decls), set(inputs) | set(outputs))
     return Translation(verilog, module_name, ctx.notes, edge_kw)
 
