@@ -596,3 +596,18 @@ def test_lists_built_at_translation_time():
     same_as_run(src, [{"rst": 1, "a": 0, "sign": 0}] + every({"a": 8, "sign": 1}, 40, {"rst": 0}))
     with pytest.raises(Unsupported, match="differs between branches"):
         translate(src.replace("        self.sum4 = n\n", "        self.sum4 = n + len(tmp)\n"))
+
+
+@pytest.mark.skipif(not have_icarus, reason="Icarus Verilog not installed")
+def test_a_one_bit_expression_sign_extended():
+    # the 1-bit value is held in a wire whose sign bit is selected: the wire needs a range ([0:0]) for Icarus to select it
+    src = ref("""    @comb
+    def o(self):
+        self.y = (self.a ^ self.b).sext(8)
+        self.z = (self.a & self.b).sext(1)
+""", {"a": 1, "b": 1}, {"y": 8, "z": 1}, combinational=True, reset=None)
+    ns: dict = {}
+    exec(src, ns)
+    cycles = [{"a": a, "b": b} for a in (0, 1) for b in (0, 1)]
+    want = [run(ns["Ref"], [c], widths={"y": 8, "z": 1}, inputs={"a": 1, "b": 1})[0] for c in cycles]
+    assert cosimulate(src, cycles) == want

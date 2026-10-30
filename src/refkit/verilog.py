@@ -966,7 +966,8 @@ _TEMPS: list[tuple[str, str]] = []
 def _temp(e: E) -> str:
     """A wire holding the expression at its own width (Verilog cannot select bits of an expression)."""
     name = f"__t{len(_TEMPS)}"
-    _TEMPS.append((f"  wire {_rng(e.width)}{name};", f"  assign {name} = {e.width}'({e.text});"))
+    # always with a range, [0:0] for one bit: a bit or part select of a scalar is an error in Icarus (sext of a 1-bit value)
+    _TEMPS.append((f"  wire [{e.width - 1}:0] {name};", f"  assign {name} = {e.width}'({e.text});"))
     return name
 
 

@@ -420,3 +420,7 @@ failed only because of x, and 9 had references the translator refused.
   differently on the two paths of a hardware branch (a list in each `case`) is fine as long as it is not read after the branch;
   reading it then is refused (that is a Python value no single Verilog expression gives). 34 more stored references translate
   and all agree with RefKit's run.
+- **T7. A 1-bit temporary wire could not be selected. fixed.** A value the translation holds in a wire to select its bits
+  (`__tN`) was declared without a range when it is 1 bit wide, and `__tN[0]` (the sign bit of a 1-bit value sign-extended,
+  `x.sext(8)`, or `x.sext(1)`) is "can not select part of scalar" in Icarus: the translation did not compile (found with T6:
+  unpacker references sign-extend single bits). Temporaries are now always declared with a range (`[0:0]`). Test.
