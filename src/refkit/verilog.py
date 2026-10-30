@@ -1031,23 +1031,30 @@ def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "c
 
         nexts = [(reg, e) for reg, e in sym.next.items()]
         if reset is not None and style == "async":
-            if any(d.reset is not None for d in cls._mems.values()) and sym.mem_writes:
-                raise Unsupported("a memory cleared by an asynchronous reset")
+            # a memory with a reset value is cleared by the reset like a register (RefKit clears it at once): its writes go in
+            # the block the reset is in, so one block drives it
+            cleared = {n for n, d in cls._mems.items() if d.reset is not None and any(w[0] == n for w in sym.mem_writes)}
             edge = "posedge" if active == 1 else "negedge"
             fast = [(r, e) for r, e in nexts if r in resettable]
-            if resettable:
+            if resettable or cleared:
                 lines.append(f"  always @({edge_kw} {clock_name} or {edge} {_vname(reset)}) begin")
                 lines.append(f"    if {level} begin")
                 lines += [f"      {r} <= {reset_value(r)};" for r in sorted(resettable)]
+                for name in sorted(cleared):
+                    decl = cls._mems[name]
+                    lines.append(f"      for ({name}__i = 0; {name}__i < {decl.depth}; {name}__i = {name}__i + 1) "
+                                 f"{name}[{name}__i] <= {decl.width}'d{rk.mask(decl.reset, decl.width)};")
                 lines.append("    end else begin")
                 lines += [f"      {r} <= {e.text};" for r, e in fast]
+                lines += [f"      if ({c.text}) {m}[{a.text}] <= {v.text};" for m, c, a, v in sym.mem_writes if m in cleared]
                 lines.append("    end")
                 lines.append("  end")
             slow = [(r, e) for r, e in nexts if r not in resettable]
-            if slow or sym.mem_writes:
+            slow_writes = [w for w in sym.mem_writes if w[0] not in cleared]
+            if slow or slow_writes:
                 lines.append(f"  always @({edge_kw} {clock_name}) begin")
                 lines += [f"    {r} <= {e.text};" for r, e in slow]
-                lines += [f"    if ({c.text}) {m}[{a.text}] <= {v.text};" for m, c, a, v in sym.mem_writes]
+                lines += [f"    if ({c.text}) {m}[{a.text}] <= {v.text};" for m, c, a, v in slow_writes]
                 lines.append("  end")
         else:
             body = [f"    {r} <= {e.text};" for r, e in nexts]

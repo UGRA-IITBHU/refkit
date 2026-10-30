@@ -493,3 +493,29 @@ def test_two_state_inputs_keep_the_proof(tmp_path):
     assert prove(DIVIDER, rtl, "TopModule", "clk", workdir=tmp_path / "r").status == "proven"
     wrong = rtl.replace("sel == 1 ? 3'd2", "sel == 1 ? 3'd3")
     assert prove(DIVIDER, wrong, "TopModule", "clk", workdir=tmp_path / "w").status == "refuted"
+
+
+def async_low(source: str) -> str:
+    return source.replace('"active": 1, "style": "sync"', '"active": 0, "style": "async"')
+
+
+@pytest.mark.skipif(not have_icarus, reason="Icarus Verilog not installed")
+def test_a_memory_cleared_by_an_asynchronous_reset():
+    src = async_low(ref("""    mem = Mem(8, 4, reset=5)
+    cnt = Reg(3, reset=0)
+    tmp = Reg(4)
+    @seq
+    def s(self):
+        self.cnt.next = self.cnt + 1
+        self.tmp.next = self.d
+        if self.we:
+            self.mem.write(self.addr, self.d)
+    @comb
+    def o(self):
+        self.q = self.mem[self.raddr]
+        self.c = self.cnt
+""", {"rst_n": 1, "we": 1, "addr": 3, "raddr": 3, "d": 4}, {"q": 4, "c": 3}, reset="rst_n"))
+    cycles = [{"rst_n": 0, "we": 0, "addr": 0, "raddr": 0, "d": 0}]
+    cycles += [{**c, "rst_n": 0 if i in (20, 21) else 1} for i, c in enumerate(every({"we": 1, "addr": 3, "raddr": 3, "d": 4}, 40))]
+    same_as_run(src, cycles)
+    assert "posedge clk or negedge rst_n" in translate(src).verilog

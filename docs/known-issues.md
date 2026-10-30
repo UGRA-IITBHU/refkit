@@ -393,3 +393,9 @@ failed only because of x, and 9 had references the translator refused.
   cycles after reset with every other input undriven, 0 do with the fix (Icarus, read-only on the BARG work folders); the
   CVDP scoring itself (cocotb in docker) was not rerun here. What it does not do: an x that the testbench drives explicitly
   also reads 0, so a test that checks that x propagates would see a difference (none known).
+- **T4. A memory cleared by an asynchronous reset. fixed.** Refused before (the most frequent refusal among CVDP references that
+  RefKit runs: 46 of 155). The memory's reset loop and its writes now go in the `always @(posedge clk or <edge> rst)` block of the
+  resettable registers (one block drives the memory), as RefKit clears it at once and writes it at the edge. Memories without a
+  reset value keep their writes in the plain clocked block. Co-simulated against RefKit (test, reset asserted mid-run); all 47
+  newly translated stored references agree with RefKit's run. Formal: Yosys reads it; a wrong RTL (other reset value) is refuted,
+  a right one ends `unknown` (k-induction does not close over the memory within depth 24), never a false `proven`.
