@@ -561,3 +561,38 @@ def test_a_match_or_elif_chain_that_covers_every_value_needs_no_default():
     with pytest.raises(Unsupported, match="not set on every path"):
         translate(ref(body.replace("            case 2 | 3:", "            case 2:"), {"rst": 1, "go": 1, "sel": 2},
                       {"status": 2, "be": 4}))
+
+
+@pytest.mark.skipif(not have_icarus, reason="Icarus Verilog not installed")
+def test_lists_built_at_translation_time():
+    # a list built in a loop and concatenated, comprehensions, reversed, a slice, * n, len, an element, sum, a loop over a list;
+    # a list built differently on two paths of a hardware branch is fine as long as it is not read after the branch
+    src = ref("""    acc = Reg(8, reset=0)
+    @seq
+    def s(self):
+        self.acc.next = sum([self.a[i] for i in range(4)]) + self.acc
+    @comb
+    def o(self):
+        parts = []
+        for i in range(4):
+            seg = self.a.part(i * 2, 2)
+            parts.append(seg.sext(4) if self.sign else seg.zext(4))
+        self.wide = cat(*parts)
+        self.rev = cat(*reversed([self.a[i] for i in range(8)]))
+        self.rep = cat(*[self.a[7:7]] * 4, *[self.a[i] for i in range(4)][::-1])
+        if self.sign:
+            tmp = [self.a[0], self.a[1]]
+            self.pick = cat(*tmp)
+        else:
+            tmp = [self.a[2]]
+            self.pick = cat(tmp[0], B(0, 1))
+        n = 0
+        for v in [self.a[3:0], self.a[7:4]]:
+            n = n + v
+        self.sum4 = n
+        self.cnt = len(parts)
+        self.acc_o = self.acc
+""", {"rst": 1, "a": 8, "sign": 1}, {"wide": 16, "rev": 8, "rep": 8, "pick": 2, "sum4": 5, "cnt": 3, "acc_o": 8})
+    same_as_run(src, [{"rst": 1, "a": 0, "sign": 0}] + every({"a": 8, "sign": 1}, 40, {"rst": 0}))
+    with pytest.raises(Unsupported, match="differs between branches"):
+        translate(src.replace("        self.sum4 = n\n", "        self.sum4 = n + len(tmp)\n"))

@@ -262,6 +262,21 @@ class _Sym:
                     new = _splice(current, hi, lo, _fit(self.expr(call.args[2]), hi - lo + 1), decl.width)
                 self.set_next(owner, new, decl.width)
                 return
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and isinstance(self.locals.get(f.value.id), _Seq) \
+                and f.attr in ("append", "extend", "insert") and not call.keywords:
+            items = self.locals[f.value.id]
+            if f.attr == "append" and len(call.args) == 1:
+                self.locals[f.value.id] = _Seq([*items, self.value_of(call.args[0])])
+                return
+            if f.attr == "extend" and len(call.args) == 1:
+                more = self.seq_of(call.args[0])
+                if more is not None:
+                    self.locals[f.value.id] = _Seq([*items, *more])
+                    return
+            if f.attr == "insert" and len(call.args) == 2:
+                at = self.int_of(call.args[0])
+                self.locals[f.value.id] = _Seq([*items[:at], self.value_of(call.args[1]), *items[at:]])
+                return
         raise Unsupported(f"call statement {ast.unparse(call)[:60]}")
 
     def branch(self, c: E, then: list[ast.stmt], orelse: list[ast.stmt]) -> None:
@@ -318,7 +333,7 @@ class _Sym:
                 # a value joined again and again (a running total over many cells) is held in a wire, or its text doubles each time
                 merged[name] = E(_temp(joined), w, joined.boolean, joined.width_sensitive) if len(joined.text) > 160 else joined
             else:
-                raise Unsupported(f"local {name} is a Python value that differs between branches")
+                merged[name] = _Diverged(name)       # an error only if it is read after the branch (Python reads it)
         self.locals = merged
 
     def state_like(self, *names: str) -> _StateE:
@@ -366,7 +381,9 @@ class _Sym:
         if isinstance(st.iter, ast.Call) and isinstance(st.iter.func, ast.Name) and st.iter.func.id == "range":
             values: list[Any] = list(range(*[self.int_of(a) for a in st.iter.args]))
         elif isinstance(st.iter, (ast.List, ast.Tuple)):
-            values = [self.py(e) for e in st.iter.elts]
+            values = [self.value_of(e) for e in st.iter.elts]
+        elif self.seq_of(st.iter) is not None:
+            values = list(self.seq_of(st.iter))  # type: ignore[arg-type]
         else:
             raise Unsupported("a for loop that is not over range(...) or a list of constants")
         self.loop_depths.append(self.hw_depth)
@@ -413,17 +430,94 @@ class _Sym:
                 like = a if isinstance(a, _StateE) else b if isinstance(b, _StateE) else self.state_like(a, b)
                 ea, eb = (v if isinstance(v, _StateE) else like.code(v) for v in (a, b))
                 return _StateE(f"({self.cond(node.test).text} ? {ea.text} : {eb.text})", like.width, names=like.names, prefix=like.prefix)
+        seq = self.seq_of(node)
+        if seq is not None:
+            return _Seq(seq)
         try:
             return self.py(node)
         except Unsupported:
             return self.expr(node)
+
+    def seq_of(self, node: ast.expr) -> list | None:
+        """A Python list (or tuple) the reference builds at translation time, as a list of its elements' values (expressions or
+        Python values): a list literal, a comprehension over range(...) or a list, a local holding one, `reversed`, `list`,
+        `+`, `* n`, a slice; None when `node` is not one."""
+        if isinstance(node, ast.Name):
+            v = self.locals.get(node.id)
+            if isinstance(v, _Diverged):
+                raise Unsupported(f"local {v.name} is a Python value that differs between branches")
+            return list(v) if isinstance(v, _Seq) else None
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return [self.value_of(e) for e in node.elts]
+        if isinstance(node, (ast.ListComp, ast.GeneratorExp)):
+            if len(node.generators) != 1 or not isinstance(node.generators[0].target, ast.Name) or node.generators[0].is_async:
+                raise Unsupported("a comprehension that is not one `for name in ...`")
+            gen = node.generators[0]
+            it = gen.iter
+            if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range":
+                values: list = list(range(*[self.int_of(a) for a in it.args]))
+            else:
+                found = self.seq_of(it)
+                if found is None:
+                    raise Unsupported("a comprehension that is not over range(...) or a list")
+                values = found
+            name, before = gen.target.id, self.locals.get(gen.target.id, _MISSING)
+            out = []
+            try:
+                for v in values:
+                    self.locals[name] = v
+                    keep = [self.static(c) for c in gen.ifs]
+                    if any(k is None for k in keep):
+                        raise Unsupported("a comprehension whose condition depends on the inputs or registers")
+                    if all(keep):
+                        out.append(self.value_of(node.elt))
+            finally:
+                if before is _MISSING:
+                    self.locals.pop(name, None)
+                else:
+                    self.locals[name] = before
+            return out
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("reversed", "list", "tuple") \
+                and len(node.args) == 1 and not node.keywords:
+            inner = self.seq_of(node.args[0])
+            if inner is None:
+                return None
+            return inner[::-1] if node.func.id == "reversed" else inner
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mult)):
+            left, right = self.seq_of(node.left), self.seq_of(node.right)
+            if isinstance(node.op, ast.Add) and left is not None and right is not None:
+                return left + right
+            if isinstance(node.op, ast.Mult) and (left is None) != (right is None):
+                return (left if left is not None else right) * self.int_of(node.right if left is not None else node.left)
+            return None
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            inner = self.seq_of(node.value)
+            if inner is None:
+                return None
+            bounds = [None if b is None else self.int_of(b) for b in (node.slice.lower, node.slice.upper, node.slice.step)]
+            return inner[slice(*bounds)]
+        return None
 
     def py(self, node: ast.expr) -> Any:
         """A compile-time Python value (parameters, loop indexes, constants), or Unsupported."""
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, str, bool)):
             return node.value
         if isinstance(node, ast.Name) and node.id in self.locals and not isinstance(self.locals[node.id], E):
-            return self.locals[node.id]
+            v = self.locals[node.id]
+            if isinstance(v, _Diverged):
+                raise Unsupported(f"local {v.name} is a Python value that differs between branches")
+            return v
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "len" and len(node.args) == 1:
+            seq = self.seq_of(node.args[0])
+            if seq is not None:
+                return len(seq)
+        if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):
+            seq = self.seq_of(node.value)
+            if seq is not None:
+                v = seq[self.int_of(node.slice)]
+                if isinstance(v, E):
+                    raise Unsupported("not a compile-time value")
+                return v
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
             attr = getattr(self.ctx.cls, node.attr, _MISSING)
             if isinstance(attr, (int, str)) and not isinstance(attr, bool) and node.attr not in self.ctx.decls \
@@ -545,6 +639,9 @@ class _Sym:
             return E(f"({c.text} ? {_num(a)} : {_num(b)})", max(a.width, b.width), a.boolean and b.boolean,
                      a.width_sensitive or b.width_sensitive)
         if isinstance(node, ast.Subscript):
+            seq = self.seq_of(node.value) if not isinstance(node.slice, ast.Slice) else None
+            if seq is not None:
+                return _as_e(seq[self.int_of(node.slice)]) or _raise("a list element that is not a value")
             return self.subscript(node)
         if isinstance(node, ast.Call):
             return self.call(node)
@@ -663,8 +760,25 @@ class _Sym:
                     return _const(self.int_of(node.args[0]), w)
                 except Unsupported:
                     return _fit(self.expr(node.args[0]), w)
+            if f.id == "len":
+                return _const(self.int_of(node))
+            if f.id == "sum" and len(node.args) == 1 and not node.keywords and self.seq_of(node.args[0]) is not None:
+                total = _const(0)                                # Python's sum starts at 0, an unsized (32-bit) constant
+                for v in self.seq_of(node.args[0]):  # type: ignore[union-attr]
+                    b = _as_e(v) or _raise("sum of a list element that is not a value")
+                    total = E(f"({_num(total)} + {_num(b)})", max(total.width, b.width), False,
+                              total.width_sensitive or b.width_sensitive)
+                return total
             if f.id == "cat":
-                parts = [self.expr(a) for a in node.args]
+                parts = []
+                for a in node.args:
+                    if isinstance(a, ast.Starred):
+                        seq = self.seq_of(a.value)
+                        if seq is None:
+                            raise Unsupported(f"cat(*{ast.unparse(a.value)[:40]})")
+                        parts += [_as_e(v) or _raise("cat of a list element that is not a value") for v in seq]
+                    else:
+                        parts.append(self.expr(a))
                 return E("{" + ", ".join(_sized(p) for p in parts) + "}", sum(p.width for p in parts))
             if f.id == "mux":
                 c, a, b = self.cond(node.args[0]), self.expr(node.args[1]), self.expr(node.args[2])
@@ -799,6 +913,17 @@ def _stmt(self: _Sym, st: ast.stmt) -> None:
 
 
 _Sym.stmt = _stmt  # type: ignore[method-assign]
+
+
+class _Seq(list):
+    """A local that holds a Python list built at translation time (its elements are expressions or Python values)."""
+
+
+class _Diverged:
+    """A local whose Python value differs between the two paths of a hardware branch: reading it is unsupported."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
 
 
 class _Partial(E):

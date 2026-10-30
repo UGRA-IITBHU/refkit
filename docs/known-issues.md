@@ -410,3 +410,13 @@ failed only because of x, and 9 had references the translator refused.
   and a w-bit value only 2**w values (inputs are two-state, T3). A chain that leaves a value out is still refused. Formal: a
   state code that is not a state is unreachable from reset; the induction may then not close (`unknown`), it cannot prove a
   wrong RTL. Test co-simulates against RefKit; the 21 references this newly translates all agree with RefKit's run.
+- **T6. Python lists built at translation time. fixed.** References build a list of slices in an unrolled loop and concatenate
+  it (`parts = []; for i in range(n): parts.append(...); cat(*parts)`, unpacker_one_hot_0001), or reverse bits with
+  `cat(*[x[i] for i in range(32)])` / `cat(*reversed(bits))` (reverse_bits_0001): refused as `List`, `ListComp`, `Starred`
+  (31 stored references RefKit runs). The symbolic execution now holds such a list as a Python list of expressions, exactly as
+  RefKit's Python run does: list literals, comprehensions over `range(...)` or a list (with conditions known at translation
+  time), `append`/`extend`/`insert`, `reversed`, `list`, `+`, `* n`, slices, `len`, an element at a constant index, `for x in
+  lst`, `cat(*lst)` and `sum(lst)` (Python's `0 + a + b ...`, the 0 an unsized 32-bit constant as RefKit lifts it). A list built
+  differently on the two paths of a hardware branch (a list in each `case`) is fine as long as it is not read after the branch;
+  reading it then is refused (that is a Python value no single Verilog expression gives). 34 more stored references translate
+  and all agree with RefKit's run.
