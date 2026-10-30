@@ -437,3 +437,16 @@ failed only because of x, and 9 had references the translator refused.
   power-up values (`init`) until the first clock, while RefKit's run resets in cycle 0 (piso_0001 and factorial_0001
   references showed as differing in cycle 0). The inputs now start unknown and take their first values at time 0 (an edge).
   The translation itself is unchanged; a real test bench that drives the reset from x/z or toggles it sees the same edge.
+- **T10. A register named like an input port. fixed (refused).** `dfmt_enable = Reg(1)` beside an input `dfmt_enable`
+  (axi_stream_upscale_0001) was emitted as a port and a `reg` of the same name, which no Verilog tool accepts. It is now an
+  `Unsupported` with that reason, so the caller sees why instead of a compile error. Test.
+- **Not a translator gap: modules clocked by a data input.** The 20 stored references of secure_read_write_bus_0001 and
+  secure_read_write_register_bank_0001 read their clock (`if self.i_capture_pulse:` inside `@seq`); BARG's interface makes
+  `i_capture_pulse` the clock port, so it is not among the inputs and RefKit's own run refuses the same references ("no input
+  called i_capture_pulse"). A module clocked by an input of any name already translates (`translate(..., clock_name)`). The
+  fix belongs in the guide or the language (say that the clock is never read in `@seq`), not in the translator.
+- **Remaining refusals of references RefKit runs (open, rarer):** `.smul`, `ord`, `bin`, `min`, `.bit_count`/`.count_ones`,
+  `.signed` on a multi-bit attribute, a dict literal, chained assignment, augmented assignment to an output, a case guard,
+  `int(self.CONST)` as a case pattern, a constant that is a state name, `None` (don't-care) outputs: one to five references each.
+- **Division by zero (open, small).** RefKit gives all ones for `x / 0` and `x % 0`; the translation emits Verilog `/` and `%`,
+  which give x. A reference that divides by an input that can be 0 differs from RefKit there.

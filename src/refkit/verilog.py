@@ -1188,6 +1188,9 @@ def translate(source: str, module_name: str = "refkit_ref", clock_name: str = "c
     # a Reg() declared without a width has the width of its output port, or 32 bits (as RefKit runs it)
     decls = {n: (rk.Reg(outputs.get(n, rk.NUMBER_WIDTH), d.reset, d.init) if isinstance(d, rk.Reg) and d.width is None else d)
              for n, d in cls._decls.items()}
+    clash = sorted(n for n in decls if n in inputs)
+    if clash:                       # a Verilog module cannot declare a register with the name of one of its ports
+        raise Unsupported(f"a register, wire or memory named like the input {clash[0]}")
     ctx = _Ctx(cls, decls, inputs, outputs)
     for name, decl in decls.items():
         if isinstance(decl, rk.State):

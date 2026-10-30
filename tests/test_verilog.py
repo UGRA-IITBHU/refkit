@@ -663,3 +663,16 @@ def test_cosimulate_an_asynchronous_reset_asserted_from_the_first_cycle():
         self.y = self.tmp
 """, {"rst_n": 1}, {"y": 8}, reset="rst_n"))
     same_as_run(src, [{"rst_n": 0}, {"rst_n": 0}] + [{"rst_n": 1}] * 5)
+
+
+def test_a_register_named_like_an_input_is_refused_not_emitted():
+    src = ref("""    en = Reg(1)
+    @seq
+    def s(self):
+        self.en.next = 1
+    @comb
+    def o(self):
+        self.y = self.en
+""", {"rst": 1, "en": 1}, {"y": 1})
+    with pytest.raises(Unsupported, match="named like the input en"):
+        translate(src)
