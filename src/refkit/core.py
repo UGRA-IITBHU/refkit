@@ -108,11 +108,13 @@ def falling(previous: int, current: int) -> int:
 class Reg:
     """A register of `width` bits. Its next value is wrapped to the width by RefKit.
 
+    `width` may be left out: `Reg()` is a register with the width of the output port of the same name when there is one (an
+    `output reg`), and otherwise 32 bits, a number that does not wrap in practice (a count with no width in the description).
     `reset` is its value after reset; `reset=None` is a register the reset does not touch (Verilog: assigned in an always block
     that does not test the reset). `init` is its value at power-up, before any reset (Verilog `reg [3:0] r = 4'd5;` or an
     `initial` block); it defaults to the reset value, or 0 for a register with no reset."""
 
-    width: int
+    width: int | None = None
     reset: int | None = 0
     init: int | None = None
 
@@ -121,8 +123,33 @@ class Reg:
         return self.init if self.init is not None else (self.reset if self.reset is not None else 0)
 
     def __post_init__(self) -> None:
-        if self.width < 1:
+        if self.width is not None and self.width < 1:
             raise RefKitError(f"Reg width must be at least 1, got {self.width}")
+
+
+#: The width of a `Reg()` declared without one that is not an output register: Verilog's `integer`.
+NUMBER_WIDTH = 32
+
+
+def _reg_width(owner: Any, name: str, decl: Reg) -> int:
+    """A register's width: the declared one; for `Reg()`, the width of the output port of that name, else NUMBER_WIDTH.
+
+    `owner` is the machine (an instance, whose `_out_widths` the run sets) or its class (no port widths known: NUMBER_WIDTH)."""
+    if decl.width is not None:
+        return decl.width
+    return (getattr(owner, "_out_widths", None) or {}).get(name, NUMBER_WIDTH)
+
+
+class _class_or_instance:
+    """A method that receives the instance when called on one and the class otherwise (`reset_values` needs the port widths a
+    run gives the instance, and is also called on a child module's class)."""
+
+    def __init__(self, function: Callable[..., Any]) -> None:
+        self.function = function
+
+    def __get__(self, obj: Any, cls: type) -> Callable[..., Any]:
+        owner = obj if obj is not None else cls
+        return lambda *args, **kwargs: self.function(owner, *args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -206,12 +233,12 @@ class Machine:
     def _engine_next(self, s: Mapping[str, Any], x: Mapping[str, int]) -> Mapping[str, Any]:
         return self.next_state(s, x)
 
-    @classmethod
+    @_class_or_instance
     def reset_values(cls) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for name, decl in cls.regs.items():
             if isinstance(decl, Reg):
-                out[name] = mask(decl.power_up, decl.width)
+                out[name] = mask(decl.power_up, _reg_width(cls, name, decl))
             elif isinstance(decl, State):
                 out[name] = decl.reset
             else:
@@ -229,7 +256,7 @@ class Machine:
             if decl is None:
                 raise RefKitError(f"next_state set {name!r}, which is not declared in regs (declared: {sorted(self.regs)})")
             if isinstance(decl, Reg):
-                new[name] = mask(value, decl.width)
+                new[name] = mask(value, _reg_width(self, name, decl))
             else:
                 if value not in decl.names:
                     raise RefKitError(f"next_state set {name!r} to {value!r}, which is not one of {list(decl.names)}")
@@ -295,7 +322,7 @@ def _after_reset(m: Machine, s: Mapping[str, Any]) -> dict[str, Any]:
     for name, decl in m.regs.items():
         if isinstance(decl, Reg):
             if decl.reset is not None:
-                out[name] = mask(decl.reset, decl.width)
+                out[name] = mask(decl.reset, _reg_width(m, name, decl))
         else:
             out[name] = decl.reset
     for name, decl in getattr(m, "_mems", {}).items():
@@ -316,12 +343,16 @@ def _asserted(spec: ResetSpec | None, x: Mapping[str, int]) -> bool:
 
 def _step(
     m: Machine, s: dict[str, Any], x: Mapping[str, int], reset: ResetSpec | None, widths: Mapping[str, int] | None,
+    seen: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, int | None]]:
-    """One clock cycle: the outputs of this cycle (sampled before the edge) and the registers after the edge."""
+    """One clock cycle: the outputs of this cycle (sampled before the edge) and the registers after the edge. `seen`, when given,
+    receives the registers as this cycle's blocks read them (an asynchronous reset already acted)."""
     m._out_widths = widths  # type: ignore[attr-defined]  # a Module needs them to give its outputs their widths
     init = m.reset_values()
     if reset is not None and reset.style == "async" and _asserted(reset, x):
         s = _after_reset(m, s)                           # an asynchronous reset shows in this very cycle
+    if seen is not None:
+        seen.append(dict(s))
     sv, xv = _View(s), _View(x)
     out = m._engine_outputs(sv, xv)
     if not isinstance(out, Mapping):
@@ -340,10 +371,47 @@ def _step(
             raise RefKitError(f"outputs did not give {missing}; every output port needs a value in every cycle (None if it does not matter)")
         if extra:
             raise RefKitError(f"outputs gave {extra}, which are not output ports (ports: {sorted(widths)})")
-    nxt = m._apply(s, m._engine_next(sv, xv))
+    change = m._engine_next(sv, xv)
+    if reset is not None and _asserted(reset, x):
+        _check_reset_overrides(m, change, reset)
+    nxt = m._apply(s, change)
     if reset is not None and _asserted(reset, x):
         nxt = _after_reset(m, nxt)                       # held in reset (sync: takes effect at this edge); registers without one go on
     return nxt, result
+
+
+def _caller_line() -> int | None:
+    """The line of the model's code that is running: the innermost frame that is not RefKit's own."""
+    import sys
+    frame = sys._getframe(1)
+    while frame is not None and frame.f_code.co_filename == __file__:
+        frame = frame.f_back
+    return frame.f_lineno if frame is not None else None
+
+
+def _check_reset_overrides(m: Machine, change: Mapping[str, Any] | None, spec: ResetSpec) -> None:
+    """A @seq block that reads the reset port and assigns a register, in a cycle in which the reset is asserted, a value other
+    than its declared reset value: the reset puts the register back at that edge, so the assignment has no effect. It is the
+    ordinary reset handled by hand, disagreeing with the declaration (or with the reset's polarity); never what was meant."""
+    if not change or spec.port not in getattr(m, "_seq_reads", ()):
+        return
+    for name, value in change.items():
+        decl = m.regs.get(name)
+        if isinstance(decl, Reg) and decl.reset is not None:
+            width = _reg_width(m, name, decl)
+            lost, reset_value = mask(value, width) != mask(decl.reset, width), mask(decl.reset, width)
+        elif isinstance(decl, State):
+            lost, reset_value = value != decl.reset, decl.reset
+        else:
+            continue
+        if lost:
+            level = "high" if spec.active == 1 else "low"
+            line = (getattr(m, "_seq_origins", None) or {}).get(name)
+            raise RefKitError(
+                f"{name}.next = {value!r}{f' (line {line})' if line else ''} is assigned in a cycle in which the reset {spec.port} is asserted ({spec.port} = "
+                f"{spec.active}, active {level}); RefKit's reset puts {name} back to {reset_value!r} at that edge, so this "
+                f"assignment has no effect. RefKit applies the reset by itself: do not test {spec.port} in the blocks; give each "
+                "register its reset value in its declaration")
 
 
 def run(
@@ -358,6 +426,7 @@ def run(
     asynchronous one acts at once (cycle i already shows the reset values). Registers start at their reset values.
     """
     m = _resolve(machine)
+    m._out_widths = widths  # type: ignore[attr-defined]
     if inputs is not None:
         m._in_widths = dict(inputs)  # type: ignore[attr-defined]
     if memory is not None:
@@ -376,15 +445,63 @@ def run(
 
 
 def _check_examples(m: Machine, spec: ResetSpec | None, widths: Mapping[str, int] | None) -> None:
+    """Each example reproduced. An example may also give an inner register's (or a State's) value in a cycle, as the register holds
+    it during that cycle; a Module's mismatch names the line of the module that gave the value."""
+    kwargs: dict[str, Any] = dict(inputs=getattr(m, "_in_widths", None), reset=spec.port if spec else None,
+                                  active=spec.active if spec else 1, style=spec.style if spec else "sync", widths=widths)
     for number, (inputs, expected) in enumerate(m.examples, start=1):
-        got = run(m, inputs, inputs=getattr(m, "_in_widths", None), reset=spec.port if spec else None, active=spec.active if spec else 1,
-                  style=spec.style if spec else "sync", widths=widths, _examples=False)
+        names = {n for want in expected for n, v in want.items() if v is not None}
+        inner = {n for n in names if n in m.regs and (widths is None or n not in widths)}
+        unknown = sorted(n for n in names - inner if widths is not None and n not in widths)
+        if unknown:
+            raise RefKitError(f"example {number} gives {unknown}, which are neither outputs nor registers of the module "
+                              f"(outputs: {sorted(widths or ())}; registers: {sorted(m.regs)})")
+        followed = None
+        if isinstance(m, Module) and not m.needs_steps:
+            followed = trace(m, inputs, **{k: v for k, v in kwargs.items() if k != "inputs"}, inputs=kwargs["inputs"])
+            got = [c.outputs for c in followed.cycles]
+        elif inner:
+            raise RefKitError(f"example {number} gives the registers {sorted(inner)}: only a Module run cycle by cycle can be followed")
+        else:
+            got = run(m, inputs, **kwargs, _examples=False)
         for cycle, (want, have) in enumerate(zip(expected, got)):
             for name, value in want.items():
-                if value is not None and have.get(name) != value:
+                if value is None:
+                    continue
+                now = followed.cycles[cycle].registers.get(name) if name in inner else have.get(name)
+                if now != value:
                     raise ExampleMismatch(
                         f"example {number}, cycle {cycle}: the description gives {name} = {value}, the machine gives "
-                        f"{have.get(name)} (inputs of that cycle: {dict(inputs[cycle])})")
+                        f"{now} (inputs of that cycle: {dict(inputs[cycle])})" + _origin(followed, cycle, name, inner))
+
+
+def _origin(followed: "Trace | None", cycle: int, name: str, inner: set[str]) -> str:
+    """Where a value an example disputes came from, as `Trace.explain` says it: the line behind it, and the cycle it ran in."""
+    if followed is None:
+        return ""
+    c = followed.cycles[cycle]
+
+    def then(ran: int) -> str:
+        """The registers in the cycle a line ran: the values it computed from."""
+        if not 0 <= ran < len(followed.cycles):
+            return ""
+        shown = " ".join(f"{k}={v if not isinstance(v, int) or v < 16 else hex(v)}" for k, v in followed.cycles[ran].registers.items())
+        return f" (registers then: {shown})" if shown else ""
+
+    if name in inner:
+        line = followed.cycles[cycle - 1].written.get(name) if cycle > 0 else None
+        if cycle > 0 and followed.cycles[cycle - 1].reset or line is None and cycle > 0 and c.reset:
+            return "; the reset gave it"
+        return "" if not isinstance(line, int) else f"; {name} is a register: line {line} `{followed.line(line)}` wrote it in cycle {cycle - 1}{then(cycle - 1)}"
+    origin = c.set_by.get(name)
+    if origin == RESET:
+        return "; the reset gave it"
+    if not isinstance(origin, int):
+        return ""
+    text = f"line {origin} `{followed.line(origin)}`"
+    if name in c.written_in:
+        return f"; {name} is a register: {text} wrote it in cycle {c.written_in[name]}{then(c.written_in[name])}"
+    return f"; {text} set it in this cycle (@comb){then(cycle)}"
 
 
 def _check_moore(m: Machine, cycles: Sequence[Mapping[str, int]], spec: ResetSpec | None, widths: Mapping[str, int] | None) -> None:
@@ -432,6 +549,7 @@ def compare(
     ma, mb = _resolve(a), _resolve(b)
     ma._in_widths = dict(inputs)  # type: ignore[attr-defined]
     mb._in_widths = dict(inputs)  # type: ignore[attr-defined]
+    ma._out_widths = mb._out_widths = widths  # type: ignore[attr-defined]
     spec = ResetSpec(reset, active, style) if reset is not None else None
     names = list(inputs)
     total = 1
@@ -546,6 +664,15 @@ class Value:
     def __pos__(self) -> "Value": return self
     def __lshift__(self, n: Any) -> "Value": return _Shift("<<", self, int(n))
     def __rshift__(self, n: Any) -> "Value": return _Shift(">>", self, int(n))
+
+    @property
+    def next(self) -> Any:
+        raise RefKitError("only a register (Reg or State) has .next; this is a value of the current cycle")
+
+    @next.setter
+    def next(self, value: Any) -> None:
+        raise RefKitError("only a register (Reg or State) has .next; this is a value of the current cycle: declare a Reg to "
+                          "hold a value across clock edges")
 
     def xnor(self, o: Any) -> "Value":
         """Verilog `a ~^ b`."""
@@ -670,6 +797,20 @@ class Value:
         """Verilog `{times{v}}`."""
         return cat(*([Bits(int(self), self.w)] * times))
 
+    def shift_in_low(self, new: Any) -> "Bits":
+        """The value with `new` shifted in at bit 0: every old bit moves up (toward the most significant bit) by the width of
+        `new`, and the top ones drop out. Verilog `{v[w-2:0], new}`, or `(v << 1) | new` for one bit. This is the shift for
+        bits that arrive MOST significant first: after w shifts the first bit is the top bit."""
+        n = _shift_part(new)
+        return Bits((int(self) << n.w) | int(n), self.w)
+
+    def shift_in_high(self, new: Any) -> "Bits":
+        """The value with `new` shifted in at the top bit: every old bit moves down (toward bit 0) by the width of `new`, and the
+        bottom ones drop out. Verilog `{new, v[w-1:1]}` for one bit. This is the shift for bits that arrive LEAST significant
+        first: after w shifts the first bit is bit 0."""
+        n = _shift_part(new)
+        return Bits(((int(n) << self.w) | int(self)) >> n.w, self.w)
+
     def reduce_and(self) -> "Bits": return Bits(int(int(self) == (1 << self.w) - 1), 1)
     def reduce_or(self) -> "Bits": return Bits(int(int(self) != 0), 1)
     def reduce_xor(self) -> "Bits": return Bits(popcount(int(self)) & 1, 1)
@@ -757,6 +898,15 @@ def _lift(o: Any) -> Value:
     if isinstance(o, _StateHandle):
         raise RefKitError("a state name cannot be used in arithmetic; compare it with a name (self.st == 'A')")
     raise RefKitError(f"cannot use {type(o).__name__} {o!r} as a Verilog value")
+
+
+def _shift_part(new: Any) -> Value:
+    """What `shift_in_low` / `shift_in_high` shift in: a sized value, or a plain 0, 1, True or False (one bit)."""
+    if isinstance(new, Value):
+        return new
+    if isinstance(new, bool) or (isinstance(new, int) and new in (0, 1)):
+        return Bits(int(new), 1)
+    raise RefKitError(f"shift_in_low/shift_in_high({new!r}): shift in a sized value (an input, a bit, B(value, width)) or 0/1")
 
 
 def _sext_to(v: Value, width: int) -> int:
@@ -959,6 +1109,11 @@ class _RegHandle(Bits):
     def next(self, value: Any) -> None:
         self._frame._assign_next(self._name, value)
 
+    def __setitem__(self, key: Any, value: Any) -> None:
+        raise RefKitError(f"self.{self._name}[...] = ... : a register changes only at the clock edge; in @seq write "
+                          f"self.{self._name}.next_bit(i, v) (Verilog {self._name}[i] <= v) or "
+                          f"self.{self._name}.next_slice(hi, lo, v) ({self._name}[hi:lo] <= v)")
+
     def next_bit(self, index: Any, bit_value: Any) -> None:
         """Verilog `r[index] <= bit_value;`: only that bit changes at the edge; several in one edge all take effect."""
         current = self._frame._pending_value(self._name, int(self), self.w)
@@ -968,6 +1123,68 @@ class _RegHandle(Bits):
         """Verilog `r[high:low] <= part_value;`."""
         current = self._frame._pending_value(self._name, int(self), self.w)
         self._frame._assign_next(self._name, Bits(current, self.w).set_slice(high, low, part_value))
+
+
+
+class _PortBits(Bits):
+    """The value of an input port in this cycle. The block reads it; it has no `.next`."""
+
+    __slots__ = ("_name",)
+
+    def __init__(self, value: int, width: int, name: str) -> None:
+        super().__init__(value, width)
+        object.__setattr__(self, "_name", name)
+
+    @property
+    def next(self) -> Any:
+        raise RefKitError(f"{self._name} is an input port: it has no .next")
+
+    @next.setter
+    def next(self, value: Any) -> None:
+        raise RefKitError(
+            f"self.{self._name}.next = ... : {self._name} is an input port; the block reads it and cannot change it. A value the "
+            "block keeps from one cycle to the next is a register: declare it (r = Reg(width)) and assign self.r.next in @seq")
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        raise RefKitError(f"self.{self._name}[...] = ... : {self._name} is an input port; the block cannot change it")
+
+
+class _NetBits(Bits):
+    """An output or a wire inside a block. In @comb its bits can be set one at a time (`self.g[0] = ...`, `self.g[3:2] = ...`,
+    Verilog `assign g[0] = ...;`); it can be read once every bit is set."""
+
+    __slots__ = ("_frame", "_name", "_unset")
+
+    def __init__(self, value: int, width: int, frame: "_Frame", name: str, unset: int) -> None:
+        super().__init__(value, width)
+        object.__setattr__(self, "_frame", frame)
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_unset", unset)
+
+    def _ev(self, ctx: int) -> int:
+        if self._unset:
+            if self._unset == (1 << self.w) - 1:
+                raise RefKitError(f"{self._name} is read before any @comb block set it: put the block that sets it first")
+            raise RefKitError(f"{self._name} is read before all its bits are set (bits not set: {_bit_list(self._unset)})")
+        return self.v
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self._frame._set_bits(self._name, key, value)
+
+    @property
+    def next(self) -> Any:
+        raise RefKitError(f"{self._name} is an output or a wire: it has no .next")
+
+    @next.setter
+    def next(self, value: Any) -> None:
+        raise RefKitError(
+            f"self.{self._name}.next = ... : {self._name} is an output (or a wire), set in @comb with self.{self._name} = ... . "
+            f"For an output that is a register, declare a Reg with its name ({self._name} = Reg()) and assign "
+            f"self.{self._name}.next in @seq")
+
+
+def _bit_list(bits_: int) -> list[int]:
+    return [i for i in range(bits_.bit_length()) if (bits_ >> i) & 1]
 
 
 class _StateHandle:
@@ -1039,6 +1256,10 @@ class _Frame:
         d(self, "_pending", {})
         d(self, "_mem_writes", {})
         d(self, "_connections", {})
+        d(self, "_partial", {})         # outputs and wires with only some bits set: name -> (value, bits not yet set)
+        d(self, "_reads", set())        # inputs read by @seq blocks (the reset check needs to know)
+        d(self, "_origins", {})         # register -> the line of the model's code that last assigned its .next
+        d(self, "_net_origins", {})     # output or wire -> the line of the model's code that last set it in @comb
 
     def __getattr__(self, name: str) -> Any:
         m = object.__getattribute__(self, "_module")
@@ -1046,10 +1267,11 @@ class _Frame:
         s = object.__getattribute__(self, "_s")
         x = object.__getattribute__(self, "_x")
         if name in nets:
-            return nets[name]
+            v = nets[name]
+            return v if v is None else _NetBits(v.v, v.w, self, name, 0)
         decl = m._decls.get(name)
         if isinstance(decl, Reg):
-            return _RegHandle(s[name], decl.width, self, name)
+            return _RegHandle(s[name], _reg_width(m, name, decl), self, name)
         if isinstance(decl, State):
             return _StateHandle(s[name], self, name)
         if isinstance(decl, Mem):
@@ -1061,7 +1283,9 @@ class _Frame:
             width = (getattr(m, "_in_widths", None) or {}).get(key)
             if width is None and isinstance(m._decls.get(key), Input):
                 width = m._decls[key].width
-            return Bits(x[key], width) if width is not None else Bits(x[key], max(1, int(x[key]).bit_length()))
+            if object.__getattribute__(self, "_mode") == "seq":
+                object.__getattribute__(self, "_reads").add(key)
+            return _PortBits(x[key], width if width is not None else max(1, int(x[key]).bit_length()), key)
         if name == "memory" and getattr(m, "_memory", None) is not None:
             return _FileMemory(m._memory)
         attr = getattr(type(m), name, _MISSING)
@@ -1070,8 +1294,10 @@ class _Frame:
                 return attr.__get__(self)                # a function of the module (a Verilog function): self is this cycle
             if not callable(attr):
                 return attr                              # a parameter (WIDTH = 8)
-        if isinstance(decl, Wire) or name in (getattr(m, "_out_widths", None) or {}):
-            raise RefKitError(f"{name} is read before any @comb block set it: put the block that sets it first")
+        width = self._net_width(name)
+        if width is not None:                            # not set yet: its bits can be set one by one; reading it raises
+            value, unset = object.__getattribute__(self, "_partial").get(name, (0, (1 << width) - 1))
+            return _NetBits(value, width, self, name, unset)
         raise RefKitError(
             f"no input, register, wire or output called {name!r}. Inputs: {sorted(x)}; "
             f"registers: {sorted(n for n, d in m._decls.items() if isinstance(d, (Reg, State, Mem)))}")
@@ -1101,16 +1327,67 @@ class _Frame:
             raise RefKitError(f"self.{name} = ... : {name} is not an output port or a declared Wire (outputs: {sorted(outs)})")
         nets = object.__getattribute__(self, "_nets")
         nets[name] = None if value is None else Bits(value, width)
+        object.__getattribute__(self, "_partial").pop(name, None)
+        object.__getattribute__(self, "_net_origins")[name] = _caller_line()
+
+    def _net_width(self, name: str) -> int | None:
+        """The width of an output port or a wire called `name`, or None when it is neither."""
+        m = object.__getattribute__(self, "_module")
+        decl = m._decls.get(name)
+        outs = getattr(m, "_out_widths", None) or {}
+        if isinstance(decl, Wire):
+            return decl.width
+        if name in outs and not isinstance(decl, (Reg, State, Mem)):
+            return outs[name]
+        if isinstance(decl, Output):
+            return decl.width
+        return None
+
+    def _set_bits(self, name: str, key: Any, value: Any) -> None:
+        """`self.g[i] = v` / `self.g[hi:lo] = v` in @comb (Verilog `assign g[i] = v;`)."""
+        if object.__getattribute__(self, "_mode") != "comb":
+            raise RefKitError(
+                f"self.{name}[...] = ... inside @seq: a @seq block only assigns registers (self.r.next = ...). Drive outputs and "
+                "wires in a @comb block")
+        width = self._net_width(name)
+        if isinstance(key, slice):
+            if key.step is not None or key.start is None or key.stop is None:
+                raise RefKitError(f"self.{name}[high:low] = ... : give both ends, high bit first")
+            high, low = int(key.start), int(key.stop)
+        else:
+            high = low = int(key)
+        if high < low:
+            raise RefKitError(f"self.{name}[{high}:{low}] = ... : write the high bit first ({name}[{low}:{high}])")
+        if low < 0 or high >= width:
+            raise RefKitError(f"self.{name}[{high}:{low}] = ... : {name} has bits {width - 1} to 0")
+        if value is None:
+            raise RefKitError(f"self.{name}[...] = None: a don't-care is given for a whole output (self.{name} = None)")
+        nets = object.__getattribute__(self, "_nets")
+        partial = object.__getattribute__(self, "_partial")
+        if nets.get(name) is not None:
+            current, unset = int(nets[name]), 0
+        else:
+            current, unset = partial.get(name, (0, (1 << width) - 1))
+        new = int(Bits(current, width).set_slice(high, low, value))
+        unset &= ~(((1 << (high - low + 1)) - 1) << low)
+        object.__getattribute__(self, "_net_origins")[name] = _caller_line()
+        if unset:
+            partial[name] = (new, unset)
+        else:
+            partial.pop(name, None)
+            nets[name] = Bits(new, width)
 
     def _assign_next(self, name: str, value: Any) -> None:
         if object.__getattribute__(self, "_mode") not in ("seq", "latch"):
             raise RefKitError(f"self.{name}.next = ... outside @seq: registers change only at the clock edge, in a @seq block")
         pending = object.__getattribute__(self, "_pending")
+        object.__getattribute__(self, "_origins")[name] = _caller_line()
         decl = object.__getattribute__(self, "_module")._decls.get(name)
         if isinstance(decl, State):
             pending[name] = value._value if isinstance(value, _StateHandle) else value
         else:
-            pending[name] = Bits(value, decl.width).v if isinstance(decl, Reg) else int(value)
+            module = object.__getattribute__(self, "_module")
+            pending[name] = Bits(value, _reg_width(module, name, decl)).v if isinstance(decl, Reg) else int(value)
 
     def _pending_value(self, name: str, current: int, width: int) -> int:
         return object.__getattribute__(self, "_pending").get(name, current)
@@ -1173,9 +1450,9 @@ class Module(Machine):
     _instances: dict[str, "Instance"] = {}
     needs_steps: bool = False
 
-    @classmethod
+    @_class_or_instance
     def reset_values(cls) -> dict[str, Any]:
-        out = {n: (mask(d.power_up, d.width) if isinstance(d, Reg) else d.reset) for n, d in cls.regs.items()}
+        out = {n: (mask(d.power_up, _reg_width(cls, n, d)) if isinstance(d, Reg) else d.reset) for n, d in cls.regs.items()}
         for n, d in cls._mems.items():
             out[n] = tuple([mask(d.reset or 0, d.width)] * d.depth)
         for n, d in cls._instances.items():
@@ -1192,8 +1469,13 @@ class Module(Machine):
     def _engine_outputs(self, s: Mapping[str, Any], x: Mapping[str, int]) -> Mapping[str, int | None]:
         frame = self._comb_frame(s, x, "comb")
         nets = object.__getattribute__(frame, "_nets")
+        partial = object.__getattribute__(frame, "_partial")
+        self._net_origins = dict(object.__getattribute__(frame, "_net_origins"))  # type: ignore[attr-defined]  # for trace()
         out: dict[str, int | None] = {}
         for name in (getattr(self, "_out_widths", None) or {n: d.width for n, d in self._decls.items() if isinstance(d, Output)}):
+            if name in partial:
+                raise RefKitError(f"output {name}: bits {_bit_list(partial[name][1])} are not set in this cycle; set every bit "
+                                  f"(self.{name}[i] = ...) or the whole output (self.{name} = ...)")
             if name in nets:
                 out[name] = None if nets[name] is None else int(nets[name])
             elif isinstance(self._decls.get(name), Reg):
@@ -1217,6 +1499,8 @@ class Module(Machine):
         for block in blocks:
             block(frame)
         change: dict[str, Any] = dict(object.__getattribute__(frame, "_pending"))
+        self._seq_reads = set(object.__getattribute__(frame, "_reads"))  # type: ignore[attr-defined]
+        self._seq_origins = dict(object.__getattribute__(frame, "_origins"))  # type: ignore[attr-defined]
         if mode == "seq":                                 # instances take the clock edge with the inputs connected this cycle
             for name, decl in self._instances.items():
                 connected = object.__getattribute__(frame, "_connections").get(name)
@@ -1279,7 +1563,10 @@ def run_stepped(
         if edges:
             blocks = [f for f in m._seq if getattr(f, "_refkit_edge", "pos") in edges]
             if blocks:
-                s = m._apply(s, m._change(s, previous, blocks, "seq"))
+                change = m._change(s, previous, blocks, "seq")
+                if spec is not None and spec.style == "sync" and _asserted(spec, previous):
+                    _check_reset_overrides(m, change, spec)
+                s = m._apply(s, change)
             # A synchronous reset acts on the edge the registers are clocked by, not on every edge of the clock: a block
             # clocked on the falling edge does not see its reset at a rising one.
             if blocks and spec is not None and spec.style == "sync" and _asserted(spec, previous):
@@ -1297,6 +1584,161 @@ def run_stepped(
 
 
 __all__ += ["Value", "Bits", "B", "cat", "mux", "clog2", "Wire", "Mem", "Input", "Output", "Instance", "seq", "comb", "latch", "casez", "Module", "run_stepped"]
+
+
+# ─── following a run: where each output's value came from ───────────────────────────────────────────────────────────────
+
+#: An output or register given its value by the reset rather than by a line of the module.
+RESET = "reset"
+
+
+@dataclass
+class TraceCycle:
+    """One clock cycle of a traced run. `registers` are the registers and states as this cycle's blocks read them (memories and
+    instances left out); `outputs` are read before the edge that ends the cycle. `set_by` gives, for each output, the line of the
+    module that gave it this cycle's value: for a @comb output the line that set it in this cycle, for a register output the line
+    whose `.next` wrote it in an earlier cycle (RESET when the reset gave it, None for its power-up value). `written` gives, for
+    each register assigned in this cycle, the line whose `.next` takes effect at the edge that ends it."""
+
+    cycle: int
+    inputs: dict[str, int]
+    registers: dict[str, Any]
+    outputs: dict[str, int | None]
+    set_by: dict[str, int | str | None]
+    written: dict[str, int | None]
+    reset: bool = False
+    written_in: dict[str, int] = field(default_factory=dict)   # register output -> the cycle in which `set_by` ran
+
+
+@dataclass
+class Trace:
+    """A traced run (`trace`): one TraceCycle per cycle, and the file the module was written in, when it has one."""
+
+    cycles: list[TraceCycle]
+    states: list[str]
+    file: str | None = None
+
+    def line(self, number: int | None, source: str | None = None) -> str:
+        """The text of a line of the module, from `source` when given (a module compiled from a string), else from its file."""
+        if not isinstance(number, int):
+            return ""
+        if source is not None:
+            lines = source.splitlines()
+            return lines[number - 1].strip() if 0 < number <= len(lines) else ""
+        if self.file is None:
+            return ""
+        import linecache
+        return linecache.getline(self.file, number).strip()
+
+    def explain(self, source: str | None = None, *, outputs: Sequence[str] | None = None, registers: Sequence[str] = (),
+                limit: int = 40) -> str:
+        """The run as a model reads it: a table of the cycles, then, for each change of an output, the line of the module that made
+        it and, for a register, the cycle in which that line ran and the states then. `outputs` limits the outputs whose changes are
+        explained; `registers` names inner registers whose changes are explained too (a value a description speaks of that is not
+        an output: what `.next` gave it, in which cycle)."""
+        def show(v: Any) -> str:
+            return "-" if v is None else str(v) if not isinstance(v, int) or v < 16 else f"0x{v:x}"
+
+        def row(values: Mapping[str, Any]) -> str:
+            return " ".join(f"{k}={show(v)}" for k, v in values.items()) or "-"
+
+        out = ["cycle | inputs | registers during the cycle | outputs (read before the clock edge that ends the cycle)"]
+        for c in self.cycles:
+            inner = {k: v for k, v in c.registers.items() if k not in c.outputs}     # a register output shows once, as an output
+            out.append(f"{c.cycle} | {row(c.inputs)} | {row(inner)} | {row(c.outputs)}" + (" (reset asserted)" if c.reset else ""))
+        changes: list[str] = []
+        for previous, c in zip(self.cycles, self.cycles[1:]):
+            for name, value in c.outputs.items():
+                if (outputs is not None and name not in outputs) or value == previous.outputs.get(name):
+                    continue
+                head = f"cycle {c.cycle}: {name} {show(previous.outputs.get(name))} -> {show(value)}."
+                origin = c.set_by.get(name)
+                if origin == RESET:
+                    changes.append(f"{head} The reset gave it.")
+                elif name in c.written_in and isinstance(origin, int):
+                    ran = c.written_in[name]
+                    when = self.cycles[ran] if 0 <= ran < len(self.cycles) else None
+                    states = row({k: v for k, v in when.registers.items() if k in self.states}) if when is not None else "-"
+                    changes.append(f"{head} {name} is a register: line {origin} `{self.line(origin, source)}` wrote it in cycle {ran}"
+                                   + (f" (then {states})" if states != "-" else "") + ", and a register shows what is written in a "
+                                   "cycle from the next cycle on.")
+                elif isinstance(origin, int):
+                    changes.append(f"{head} Set in this same cycle by line {origin} `{self.line(origin, source)}` (@comb).")
+            for name in registers:
+                if name in c.outputs or name not in c.registers or c.registers[name] == previous.registers.get(name):
+                    continue
+                head = f"cycle {c.cycle}: {name} {show(previous.registers.get(name))} -> {show(c.registers[name])}."
+                line = previous.written.get(name)
+                if previous.reset or (c.reset and line is None):
+                    changes.append(f"{head} The reset gave it.")
+                elif isinstance(line, int):
+                    states = row({k: v for k, v in previous.registers.items() if k in self.states})
+                    changes.append(f"{head} {name} is a register: line {line} `{self.line(line, source)}` wrote it in cycle {previous.cycle}"
+                                   + (f" (then {states})" if states != "-" else "") + ".")
+        if changes:
+            out.append("")
+            out.append("Where each change of an output came from:")
+            out.extend(changes[:limit])
+            if len(changes) > limit:
+                out.append(f"... and {len(changes) - limit} more changes")
+        return "\n".join(out)
+
+
+def trace(
+    machine: type[Module] | Module, cycles: Sequence[Mapping[str, int]], *, reset: str | None = None, active: int = 1,
+    style: str = "sync", widths: Mapping[str, int] | None = None, inputs: Mapping[str, int] | None = None, memory: Any = None,
+) -> Trace:
+    """Run a Module as `run` does and follow it: the registers in each cycle, and which line of the module gave each output and
+    each register its value. A model checks a run it can read cycle by cycle, with the line behind every change, far better than
+    it simulates its own code in its head (a register written in a state shows in the cycle AFTER the state is entered)."""
+    m = _resolve(machine)
+    if not isinstance(m, Module):
+        raise RefKitError("trace follows a Module")
+    if m.needs_steps:
+        raise RefKitError("trace follows a Module run cycle by cycle (no negedge or dual-edge @seq block, no @latch)")
+    m._out_widths = widths  # type: ignore[attr-defined]
+    if inputs is not None:
+        m._in_widths = dict(inputs)  # type: ignore[attr-defined]
+    if memory is not None:
+        m._memory = memory  # type: ignore[attr-defined]
+    spec = ResetSpec(reset, active, style) if reset is not None else None
+    resettable = {n for n, d in m.regs.items() if not isinstance(d, Reg) or d.reset is not None}
+    s = m.reset_values()
+    last: dict[str, tuple[int | str | None, int]] = {}      # register -> (the line that gave it its value, the cycle it ran in)
+    rows: list[TraceCycle] = []
+    for i, x in enumerate(cycles):
+        asserted = _asserted(spec, x)
+        if asserted and spec is not None and spec.style == "async":
+            last.update({n: (RESET, i) for n in resettable})
+        seen: list[dict[str, Any]] = []
+        nxt, o = _step(m, s, x, spec, widths, seen)
+        nets = dict(getattr(m, "_net_origins", {}))
+        written = dict(getattr(m, "_seq_origins", {}))
+        set_by: dict[str, int | str | None] = {}
+        written_in: dict[str, int] = {}
+        for name in o:
+            if name in nets:
+                set_by[name] = nets[name]
+            elif name in m.regs:
+                origin, ran = last.get(name, (None, -1))
+                set_by[name] = origin
+                if isinstance(origin, int):
+                    written_in[name] = ran
+        registers = {n: v for n, v in seen[0].items() if n in m.regs}
+        rows.append(TraceCycle(i, {k: int(v) for k, v in x.items()}, registers, o, set_by, written, asserted, written_in))
+        for name, line in written.items():
+            if name in m.regs and nxt.get(name) != seen[0].get(name) or name not in last:
+                last[name] = (line, i)
+        if asserted:
+            last.update({n: (RESET, i) for n in resettable})
+        s = nxt
+    # The lines a trace names are lines of the module's blocks: the file they were compiled from (a subclass may live elsewhere).
+    blocks = [*m._comb, *m._seq]
+    file = blocks[0].__code__.co_filename if blocks else None
+    return Trace(rows, [n for n, d in m.regs.items() if isinstance(d, State)], file)
+
+
+__all__ += ["trace", "Trace", "TraceCycle", "RESET", "load"]
 
 
 # ─── exact comparison of two completed references (harness `reference-stability`) ─────────────────────────────────────
@@ -1347,10 +1789,21 @@ __all__ += ["compare_sources"]
 
 # ─── stimulus that visits every transition of a RefKit reference ────────────────────────────────────────────────────────
 
+def load(source: str, namespace: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run a reference's source and return its namespace. It is compiled under a name of its own (`<reference-…>`) whose text is
+    registered with linecache, so a traceback, `trace` and an example's mismatch can quote its lines."""
+    import hashlib
+    import linecache
+    name = f"<reference-{hashlib.sha1(source.encode()).hexdigest()[:12]}>"
+    linecache.cache[name] = (len(source), None, source.splitlines(True), name)
+    ns: dict[str, Any] = {} if namespace is None else namespace
+    exec(compile(source, name, "exec"), ns)  # noqa: S102
+    return ns
+
+
 def _meta_of(source: str) -> dict[str, Any] | None:
-    ns: dict[str, Any] = {}
     try:
-        exec(compile(source, "<reference>", "exec"), ns)  # noqa: S102
+        ns = load(source)
     except Exception:  # noqa: BLE001
         return None
     meta = ns.get("__refkit__")
@@ -1380,6 +1833,7 @@ def transition_walk(
     spec = ResetSpec(reset_port, active, meta["style"])
     widths = meta["widths"]
     m._in_widths = dict(meta["inputs"])  # type: ignore[attr-defined]
+    m._out_widths = widths  # type: ignore[attr-defined]
     names = list(inputs)
     alphabet = [{**dict(zip(names, values)), reset_port: 1 - active}
                 for values in product(*[range(1 << inputs[n]) for n in names])]

@@ -250,7 +250,7 @@ def _guide_modules():
 def _ports(source):
     """Inputs read and outputs set by a guide example, found by running it once on a probe (names only, widths 8)."""
     inputs = sorted(set(re.findall(r"self\.([a-z_]\w*)", source)) - set(re.findall(r"^\s+(\w+) = (?:Reg|State|Mem|Wire)\(", source, re.M)))
-    outputs = sorted(set(re.findall(r"self\.(\w+) = ", source)))
+    outputs = sorted(set(re.findall(r"self\.(\w+)(?:\[[^\]]*\])? = ", source)))
     return inputs, outputs
 
 
@@ -263,7 +263,10 @@ def test_every_module_example_of_the_guide_runs():
         ref = ns["Ref"]
         decls = set(ref._decls)
         _, set_names = _ports(source)
-        outputs = {n: 8 for n in set_names if n not in decls}
+        bit_set = {}                                       # outputs set bit by bit: as wide as their highest bit
+        for name, index in re.findall(r"self\.(\w+)\[(\d+)\] = ", source):
+            bit_set[name] = max(bit_set.get(name, 0), int(index) + 1)
+        outputs = {n: bit_set.get(n, 8) for n in set_names if n not in decls}
         read = set(re.findall(r"self\.([a-z_]\w*)", source)) - decls - set(outputs) - {"clk"}
         inputs = {n: 1 if n in {"en", "go", "x", "rx", "wr", "rd", "load", "clear", "valid", "din", "d"} and n != "d" else 8 for n in read}
         rng = random.Random(0)
@@ -520,3 +523,118 @@ def test_a_synchronous_reset_acts_only_on_the_edge_the_register_is_clocked_by():
     q = [o["q"] for o in run_stepped(Neg, steps, clock="clk", reset="reset", active=1, style="sync",
                                      widths={"q": 8}, inputs={"d": 8, "reset": 1})]
     assert q == [0x34, 0x7F, 0x7F, 0x7F, 0x34]   # the rising edge after reset rose leaves q alone; the falling one resets it
+
+
+# ─── written the way a language model writes: shifts by where the bit enters, numbers without widths, bits of outputs ─────
+
+
+def test_shift_in_low_and_high_say_where_the_new_bit_enters():
+    v = B(0b1010, 4)
+    assert int(v.shift_in_low(1)) == 0b0101          # MSB first: old bits move up, the new one is bit 0
+    assert int(v.shift_in_high(1)) == 0b1101         # LSB first: old bits move down, the new one is the top bit
+    assert int(v.shift_in_low(B(0b11, 2))) == 0b1011
+    assert int(v.shift_in_high(B(0b01, 2))) == 0b0110
+    with pytest.raises(RefKitError, match="sized value"):
+        v.shift_in_low(5)
+
+
+def test_a_reg_without_a_width_is_its_output_port_or_a_number():
+    class Ref(Module):
+        q = Reg()                                    # the output register: the port's 2 bits, so it wraps like the port
+        falls = Reg()                                # a count: 32 bits, it does not wrap at 5 bits
+
+        @seq
+        def s(self):
+            self.q.next = self.q + 1
+            self.falls.next = self.falls + 1
+
+        @comb
+        def o(self):
+            self.wrapped = self.q == 0
+            self.long = self.falls > 31
+
+    got = run(Ref, [{"en": 0}] * 40, widths={"q": 2, "wrapped": 1, "long": 1})
+    assert [o["q"] for o in got[:5]] == [0, 1, 2, 3, 0] and got[4]["wrapped"] == 1
+    assert got[32]["long"] == 1
+
+
+def test_bits_of_an_output_can_be_set_one_at_a_time_in_comb():
+    class Ref(Module):
+        @comb
+        def o(self):
+            self.g[0] = self.r[0]
+            self.g[2:1] = self.r[2:1]
+            self.any = self.g.reduce_or()
+
+    got = run(Ref, [{"r": 5}, {"r": 0}], widths={"g": 3, "any": 1}, inputs={"r": 3})
+    assert got == [{"g": 5, "any": 1}, {"g": 0, "any": 0}]
+
+    class Missing(Module):
+        @comb
+        def o(self):
+            self.g[0] = 1
+
+    with pytest.raises(RefKitError, match=r"bits \[1, 2\] are not set"):
+        run(Missing, [{"r": 0}], widths={"g": 3}, inputs={"r": 3})
+
+
+def test_errors_say_what_to_write_instead():
+    class InputNext(Module):
+        @seq
+        def s(self):
+            self.y.next = self.x
+
+        @comb
+        def o(self):
+            self.z = self.x
+
+    with pytest.raises(RefKitError, match="is an input port"):
+        run(InputNext, [{"x": 1, "y": 0}], widths={"z": 1}, inputs={"x": 1, "y": 3})
+
+    class RegBit(Module):
+        r = Reg(4)
+
+        @seq
+        def s(self):
+            self.r[0] = 1
+
+        @comb
+        def o(self):
+            self.z = self.r
+
+    with pytest.raises(RefKitError, match="next_bit"):
+        run(RegBit, [{"x": 0}], widths={"z": 4})
+
+
+def test_a_reset_handled_by_hand_that_the_reset_overrides_is_reported():
+    class ByHand(Module):
+        st = State("A", "F", "B")
+
+        @seq
+        def s(self):
+            if self.st == "A":
+                if not self.resetn:                  # meant: "when the reset is released"; it tests the reset asserted
+                    self.st.next = "F"
+            elif self.st == "F":
+                self.st.next = "B"
+
+        @comb
+        def o(self):
+            self.f = self.st == "F"
+
+    cycles = [{"resetn": 0}, {"resetn": 1}, {"resetn": 1}]
+    with pytest.raises(RefKitError, match=r"st.next = 'F' \(line \d+\) is assigned.*has no effect"):
+        run(ByHand, cycles, reset="resetn", active=0, widths={"f": 1})
+
+    class Agrees(Module):                            # the ordinary reset written out, agreeing with the declaration: fine
+        q = Reg(4)
+
+        @seq
+        def s(self):
+            if self.reset:
+                self.q.next = 0
+            else:
+                self.q.next = self.q + 1
+
+    assert [o["q"] for o in run(Agrees, [{"reset": 1}, {"reset": 0}, {"reset": 0}], reset="reset", widths={"q": 4})] == [0, 0, 1]
+
